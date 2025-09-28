@@ -101,6 +101,12 @@ func (c *Client) PatchStepRunStatus(ctx context.Context, stepRunName string, pat
 
 // getPodNamespace gets the namespace of the pod where this code is running.
 func getPodNamespace() string {
+	if ns, ok := os.LookupEnv("BUBU_STEPRUN_NAMESPACE"); ok && ns != "" {
+		return ns
+	}
+	if ns, ok := os.LookupEnv("BUBU_POD_NAMESPACE"); ok && ns != "" {
+		return ns
+	}
 	if ns, ok := os.LookupEnv("POD_NAMESPACE"); ok {
 		return ns
 	}

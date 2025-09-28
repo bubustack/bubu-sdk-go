@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bubustack/bobrapet/pkg/refs"
@@ -50,8 +51,32 @@ func LoadExecutionContextData() (*ExecutionContextData, error) {
 		}
 	}
 
-	// Config and Secrets would be populated here by scanning for environment
-	// variables with specific prefixes, e.g., BUBU_CONFIG_ and BUBU_SECRET_.
+	// Load config from BUBU_CONFIG_*
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, "BUBU_CONFIG_") {
+			continue
+		}
+		// env format: KEY=VALUE
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimPrefix(parts[0], "BUBU_CONFIG_")
+		execCtxData.Config[key] = parts[1]
+	}
+
+	// Load secrets from BUBU_SECRET_*
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, "BUBU_SECRET_") {
+			continue
+		}
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimPrefix(parts[0], "BUBU_SECRET_")
+		execCtxData.Secrets[key] = parts[1]
+	}
 
 	return execCtxData, nil
 }

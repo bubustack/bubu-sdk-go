@@ -14,6 +14,7 @@ import (
 	"log/slog"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
+	"github.com/bubustack/bobrapet/pkg/enums"
 	bobravozgrpcproto "github.com/bubustack/bobravoz-grpc/proto"
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/k8s"
@@ -24,8 +25,6 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // === Batch Execution ===
@@ -62,6 +61,77 @@ func Start[C any](ctx context.Context, engram engram.Engram[C]) error {
 		// This Run function will be a simplified version for dynamic inputs.
 		return runBatch(ctx, batchEngram)
 	}
+}
+
+// Run is the main entry point for batch workflows (Kubernetes Job mode).
+// It initializes the SDK runtime, unmarshals the Engram config and inputs into
+// their respective generic types, executes the engram, and patches the StepRun status.
+func Run[C any, I any](ctx context.Context, e engram.BatchEngram[C, I]) error {
+	execCtxData, err := runtime.LoadExecutionContextData()
+	if err != nil {
+		return fmt.Errorf("failed to load execution context: %w", err)
+	}
+
+	// Unmarshal config.
+	config, err := runtime.UnmarshalFromMap[C](execCtxData.Config)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	secrets := engram.NewSecrets(execCtxData.Secrets)
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	tracer := otel.Tracer("bubu-sdk")
+	execCtx := engram.NewExecutionContext(logger, tracer, execCtxData.StoryInfo)
+
+	if err := e.Init(ctx, config, secrets); err != nil {
+		return fmt.Errorf("engram initialization failed: %w", err)
+	}
+
+	sm, err := storage.NewManager(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create storage manager: %w", err)
+	}
+
+	// Hydrate inputs to resolve any storage references before unmarshaling.
+	hydratedInputs, err := sm.Hydrate(ctx, execCtxData.Inputs)
+	if err != nil {
+		return fmt.Errorf("failed to hydrate inputs: %w", err)
+	}
+
+	// Convert inputs to the target input type I.
+	var typedInputs I
+	switch v := hydratedInputs.(type) {
+	case map[string]interface{}:
+		typedInputs, err = runtime.UnmarshalFromMap[I](v)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal inputs into target type: %w", err)
+		}
+	default:
+		// If the inputs are not a map, we try JSON roundtrip into the target type.
+		bytes, marshalErr := json.Marshal(v)
+		if marshalErr != nil {
+			return fmt.Errorf("failed to marshal inputs for conversion: %w", marshalErr)
+		}
+		if unmarshalErr := json.Unmarshal(bytes, &typedInputs); unmarshalErr != nil {
+			return fmt.Errorf("failed to unmarshal inputs into target type: %w", unmarshalErr)
+		}
+	}
+
+	result, err := e.Process(ctx, execCtx, typedInputs)
+	if err != nil {
+		result = &engram.Result{Error: err}
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		return fmt.Errorf("engram processing failed: %w (patch error: %v)", err, patchErr)
+	}
+	if result.Error != nil {
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		if patchErr != nil {
+			return fmt.Errorf("engram returned an error: %w (patch error: %v)", result.Error, patchErr)
+		}
+		return fmt.Errorf("engram returned an error: %w", result.Error)
+	}
+
+	return patchStepRunStatus(ctx, sm, execCtxData, result, "Succeeded")
 }
 
 // runBatch is a new internal function to handle batch execution with dynamic inputs.
@@ -139,37 +209,24 @@ func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtx
 		return fmt.Errorf("failed to create k8s client: %w", err)
 	}
 
-	rawOutputs := &k8sruntime.RawExtension{Raw: outputBytes}
 	finishedAt := metav1.Now()
-	duration := finishedAt.Sub(execCtxData.StartedAt.Time).String()
-
-	patchPayload := map[string]interface{}{
-		"status": map[string]interface{}{
-			"outputs":    rawOutputs,
-			"phase":      phase,
-			"finishedAt": finishedAt,
-			"duration":   duration,
-		},
+	newStatus := runsv1alpha1.StepRunStatus{
+		Phase:      enums.Phase(phase),
+		Output:     &k8sruntime.RawExtension{Raw: outputBytes},
+		FinishedAt: &finishedAt,
+		Duration:   finishedAt.Sub(execCtxData.StartedAt.Time).String(),
 	}
-
 	if result.Error != nil {
-		patchPayload["status"].(map[string]interface{})["lastFailureMsg"] = result.Error.Error()
+		newStatus.LastFailureMsg = result.Error.Error()
 	}
 
-	patchJSON, err := json.Marshal(patchPayload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal patch: %w", err)
-	}
-
-	stepRun := &runsv1alpha1.StepRun{}
-	patch := client.RawPatch(types.MergePatchType, patchJSON)
-
-	return k8sClient.PatchStatus(ctx, execCtxData.StoryInfo.StepRunID, stepRun, patch)
+	return k8sClient.PatchStepRunStatus(ctx, execCtxData.StoryInfo.StepRunID, newStatus)
 }
 
 // getExecutionMode determines the execution mode from an environment variable.
 func getExecutionMode() string {
-	mode := os.Getenv("BUBU_EXECUTION_MODE")
+	// Align with controller: BOBRAPET_EXECUTION_MODE is set by bobrapet.
+	mode := os.Getenv("BOBRAPET_EXECUTION_MODE")
 	if mode == "" {
 		return "batch" // Default mode
 	}
@@ -288,7 +345,8 @@ func StartStreamServer[C any](ctx context.Context, e engram.StreamingEngram[C]) 
 		return fmt.Errorf("streaming engram initialization failed: %w", err)
 	}
 
-	port := os.Getenv("GRPC_PORT")
+	// Controller sets BUBU_GRPC_PORT
+	port := os.Getenv("BUBU_GRPC_PORT")
 	if port == "" {
 		port = "8080"
 	}
@@ -308,7 +366,7 @@ func StartStreamServer[C any](ctx context.Context, e engram.StreamingEngram[C]) 
 // StreamTo connects to a downstream gRPC server and streams data to it.
 // This is the client side of the SDK.
 func StreamTo(ctx context.Context, target string, in <-chan []byte) error {
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("did not connect: %w", err)
 	}
