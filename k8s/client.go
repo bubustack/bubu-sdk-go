@@ -85,12 +85,16 @@ func (c *Client) TriggerStory(ctx context.Context, storyName string, inputs map[
 	return storyRun, nil
 }
 
-func (c *Client) PatchStatus(ctx context.Context, name string, obj client.Object, patch client.Patch) error {
-	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: c.namespace}, obj); err != nil {
-		return fmt.Errorf("failed to get object '%s': %w", name, err)
+func (c *Client) PatchStepRunStatus(ctx context.Context, stepRunName string, patchData runsv1alpha1.StepRunStatus) error {
+	stepRun := &runsv1alpha1.StepRun{}
+	if err := c.Get(ctx, types.NamespacedName{Name: stepRunName, Namespace: c.namespace}, stepRun); err != nil {
+		return fmt.Errorf("failed to get StepRun '%s' for status patch: %w", stepRunName, err)
 	}
-	if err := c.Status().Patch(ctx, obj, patch); err != nil {
-		return fmt.Errorf("failed to patch status for object '%s': %w", name, err)
+
+	patch := client.MergeFrom(stepRun.DeepCopy())
+	stepRun.Status = patchData
+	if err := c.Status().Patch(ctx, stepRun, patch); err != nil {
+		return fmt.Errorf("failed to patch StepRun '%s' status: %w", stepRunName, err)
 	}
 	return nil
 }
