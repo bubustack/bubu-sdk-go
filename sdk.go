@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -104,16 +105,24 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 
 	result, err := e.Process(ctx, execCtx, hydratedInputs)
 	if err != nil {
-		return fmt.Errorf("engram processing failed: %w", err)
+		// If the process function itself errors, we create a synthetic result
+		// to pass to the patch function.
+		result = &engram.Result{Error: err}
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		return fmt.Errorf("engram processing failed: %w (patch error: %v)", err, patchErr)
 	}
 	if result.Error != nil {
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		if patchErr != nil {
+			return fmt.Errorf("engram returned an error: %w (patch error: %v)", result.Error, patchErr)
+		}
 		return fmt.Errorf("engram returned an error: %w", result.Error)
 	}
 
-	return patchStepRunStatus(ctx, sm, execCtxData, result)
+	return patchStepRunStatus(ctx, sm, execCtxData, result, "Succeeded")
 }
 
-func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtxData *runtime.ExecutionContextData, result *engram.Result) error {
+func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtxData *runtime.ExecutionContextData, result *engram.Result, phase string) error {
 	// Handle the output: dehydrate if necessary and patch the StepRun status.
 	output, err := sm.Dehydrate(ctx, result.Data, execCtxData.StoryInfo.StepRunID)
 	if err != nil {
@@ -131,11 +140,23 @@ func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtx
 	}
 
 	rawOutputs := &k8sruntime.RawExtension{Raw: outputBytes}
-	patchJSON, err := json.Marshal(map[string]interface{}{
+	finishedAt := metav1.Now()
+	duration := finishedAt.Sub(execCtxData.StartedAt.Time).String()
+
+	patchPayload := map[string]interface{}{
 		"status": map[string]interface{}{
-			"outputs": rawOutputs,
+			"outputs":    rawOutputs,
+			"phase":      phase,
+			"finishedAt": finishedAt,
+			"duration":   duration,
 		},
-	})
+	}
+
+	if result.Error != nil {
+		patchPayload["status"].(map[string]interface{})["lastFailureMsg"] = result.Error.Error()
+	}
+
+	patchJSON, err := json.Marshal(patchPayload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal patch: %w", err)
 	}

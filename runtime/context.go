@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/bubustack/bobrapet/pkg/refs"
 	"github.com/bubustack/bubu-sdk-go/engram"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ExecutionContextData is the structure of the data provided by the
@@ -17,10 +19,18 @@ type ExecutionContextData struct {
 	Secrets   map[string]string      `json:"secrets"`
 	StoryInfo engram.StoryInfo       `json:"storyInfo"`
 	StoryRef  *refs.StoryReference   `json:"storyRef,omitempty"`
+	StartedAt metav1.Time            `json:"startedAt"`
 }
 
 // LoadExecutionContextData loads the execution context from environment variables.
 func LoadExecutionContextData() (*ExecutionContextData, error) {
+	startedAt := metav1.Now()
+	if startedAtStr := os.Getenv("BUBU_STARTED_AT"); startedAtStr != "" {
+		if t, err := time.Parse(time.RFC3339, startedAtStr); err == nil {
+			startedAt = metav1.NewTime(t)
+		}
+	}
+
 	execCtxData := &ExecutionContextData{
 		Inputs:  make(map[string]interface{}),
 		Config:  make(map[string]interface{}),
@@ -31,6 +41,7 @@ func LoadExecutionContextData() (*ExecutionContextData, error) {
 			StepName:   os.Getenv("BUBU_STEP_NAME"),
 			StepRunID:  os.Getenv("BUBU_STEPRUN_NAME"),
 		},
+		StartedAt: startedAt,
 	}
 
 	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
