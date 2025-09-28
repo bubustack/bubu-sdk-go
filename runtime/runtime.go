@@ -80,23 +80,29 @@ func New[C any, I any](e engram.BatchEngram[C, I]) (*Runtime[C, I], error) {
 }
 
 // Execute runs the full lifecycle of a batch Engram.
-func (r *Runtime[C, I]) Execute(ctx context.Context) error {
+func (r *Runtime[C, I]) Execute(ctx context.Context, inputs map[string]interface{}) error {
 	// Read the execution context from the well-known file.
 	execCtxData, err := LoadExecutionContextData("/var/run/bubu/context.json")
 	if err != nil {
 		return fmt.Errorf("failed to load execution context: %w", err)
 	}
 
+	// If inputs are not provided directly, use the ones from the context file.
+	if inputs == nil {
+		// Hydrate inputs before unmarshaling.
+		hydratedInputs, err := r.storageManager.Hydrate(ctx, execCtxData.Inputs)
+		if err != nil {
+			return fmt.Errorf("failed to hydrate inputs: %w", err)
+		}
+		inputs = hydratedInputs.(map[string]interface{})
+	}
+
 	// Initialize logger and tracer.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	tracer := otel.Tracer("bubu-sdk")
 
-	// Hydrate inputs before unmarshaling.
-	hydratedInputs, err := r.storageManager.Hydrate(ctx, execCtxData.Inputs)
-	if err != nil {
-		return fmt.Errorf("failed to hydrate inputs: %w", err)
-	}
-	inputs, err := unmarshalFromMap[I](hydratedInputs.(map[string]interface{}))
+	// Unmarshal the dynamic inputs into the static type I.
+	typedInputs, err := unmarshalFromMap[I](inputs)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal inputs: %w", err)
 	}
@@ -115,7 +121,7 @@ func (r *Runtime[C, I]) Execute(ctx context.Context) error {
 	}
 
 	// 2. Process
-	result, err := r.engram.Process(ctx, execCtx, inputs)
+	result, err := r.engram.Process(ctx, execCtx, typedInputs)
 	if err != nil {
 		// Write error to a well-known file for the controller to find.
 		_ = os.WriteFile("/var/run/bubu/error.json", []byte(err.Error()), 0644)

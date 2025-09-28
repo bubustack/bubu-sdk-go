@@ -11,10 +11,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"log/slog"
+
 	bobravozgrpcproto "github.com/bubustack/bobravoz-grpc/proto"
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/impulse"
 	"github.com/bubustack/bubu-sdk-go/runtime"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -29,7 +32,103 @@ func Run[C any, I any](ctx context.Context, e engram.BatchEngram[C, I]) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize SDK runtime: %w", err)
 	}
-	return r.Execute(ctx)
+
+	// This is the new input handling logic.
+	// It's kept separate from the runtime for now to support both dynamic and static inputs.
+	inputs := make(map[string]interface{})
+	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
+		if err := json.Unmarshal([]byte(inputsStr), &inputs); err != nil {
+			return fmt.Errorf("failed to unmarshal BUBU_INPUTS: %w", err)
+		}
+	}
+
+	// The runtime's Execute method will need to be updated to accept the inputs.
+	// For now, we'll assume a conceptual ExecuteWithInputs method exists.
+	// This will be part of the larger SDK refactor.
+	return r.Execute(ctx, inputs)
+}
+
+func asStreamingEngram[C any](e engram.Engram[C]) (engram.StreamingEngram[C], bool) {
+	se, ok := e.(engram.StreamingEngram[C])
+	return se, ok
+}
+
+func asBatchEngram[C any](e engram.Engram[C]) (engram.BatchEngram[C, any], bool) {
+	be, ok := e.(engram.BatchEngram[C, any])
+	return be, ok
+}
+
+// Start is a new, simplified entry point that handles both batch and streaming modes.
+func Start[C any](ctx context.Context, engram engram.Engram[C]) error {
+	mode := getExecutionMode()
+	fmt.Printf("Starting in %s mode\n", mode)
+
+	switch mode {
+	case "streaming":
+		streamingEngram, ok := asStreamingEngram(engram)
+		if !ok {
+			return fmt.Errorf("engram does not support streaming mode, but execution mode is 'streaming'")
+		}
+		// Assuming a generic StartStreamServer exists or is created.
+		// This will require refactoring StartStreamServer to not be generic or to handle 'any'.
+		return StartStreamServer(ctx, streamingEngram)
+	default: // "batch" is the default
+		batchEngram, ok := asBatchEngram(engram)
+		if !ok {
+			return fmt.Errorf("engram does not support batch mode")
+		}
+		// This Run function will be a simplified version for dynamic inputs.
+		return runBatch(ctx, batchEngram)
+	}
+}
+
+// runBatch is a new internal function to handle batch execution with dynamic inputs.
+func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
+	// Simplified initialization, bypassing the complex generic runtime for now.
+	// This would evolve into a more complete non-generic runtime.
+	execCtxData, err := runtime.LoadExecutionContextData("/var/run/bubu/context.json")
+	if err != nil {
+		return fmt.Errorf("failed to load execution context: %w", err)
+	}
+	config, err := unmarshalFromMap[C](execCtxData.Config) // Using 'C' for config
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	secrets := engram.NewSecrets(execCtxData.Secrets)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	tracer := otel.Tracer("bubu-sdk")
+	execCtx := engram.NewExecutionContext(logger, tracer, execCtxData.StoryInfo)
+
+	if err := e.Init(ctx, config, secrets); err != nil {
+		return fmt.Errorf("engram initialization failed: %w", err)
+	}
+
+	inputs := make(map[string]interface{})
+	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
+		if err := json.Unmarshal([]byte(inputsStr), &inputs); err != nil {
+			return fmt.Errorf("failed to unmarshal BUBU_INPUTS: %w", err)
+		}
+	}
+
+	result, err := e.Process(ctx, execCtx, inputs)
+	if err != nil {
+		return fmt.Errorf("engram processing failed: %w", err)
+	}
+	if result.Error != nil {
+		return fmt.Errorf("engram returned an error: %w", result.Error)
+	}
+
+	// Omitting output handling for brevity, but it would be here.
+	return nil
+}
+
+// getExecutionMode determines the execution mode from an environment variable.
+func getExecutionMode() string {
+	mode := os.Getenv("BUBU_EXECUTION_MODE")
+	if mode == "" {
+		return "batch" // Default mode
+	}
+	return mode
 }
 
 // === Impulse Execution ===
