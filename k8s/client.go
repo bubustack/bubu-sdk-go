@@ -1,4 +1,4 @@
-package impulse
+package k8s
 
 import (
 	"context"
@@ -7,13 +7,15 @@ import (
 	"os"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/refs"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/bubustack/bobrapet/pkg/refs"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -25,18 +27,14 @@ func init() {
 	utilruntime.Must(runsv1alpha1.AddToScheme(scheme))
 }
 
-// Client is a wrapper around the Kubernetes client that is scoped to the
-// namespace of the running Impulse and provides helper methods for creating
-// StoryRuns.
+// Client is a wrapper around the controller-runtime Kubernetes client.
 type Client struct {
-	kubeClient client.Client
-	namespace  string
-	storyName  string
+	client.Client
+	namespace string
 }
 
-// NewClient creates a new Impulse client. It's intended to be called by the
-// SDK runtime.
-func NewClient(storyName string) (*Client, error) {
+// NewClient creates a new Kubernetes client with an in-cluster configuration.
+func NewClient() (*Client, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
@@ -50,50 +48,51 @@ func NewClient(storyName string) (*Client, error) {
 	}
 
 	return &Client{
-		kubeClient: kubeClient,
-		namespace:  getPodNamespace(),
-		storyName:  storyName,
+		Client:    kubeClient,
+		namespace: getPodNamespace(),
 	}, nil
 }
 
-// CreateStoryRun creates a new StoryRun resource in the cluster. The StoryRun's
-// namespace will be automatically set to the Impulse's own namespace.
-func (c *Client) CreateStoryRun(ctx context.Context, storyRun *runsv1alpha1.StoryRun) error {
-	storyRun.Namespace = c.namespace
-	if err := c.kubeClient.Create(ctx, storyRun); err != nil {
-		return fmt.Errorf("failed to create storyrun: %w", err)
-	}
-	return nil
+func (c *Client) GetNamespace() string {
+	return c.namespace
 }
 
 // TriggerStory creates a new StoryRun for the configured story with the provided inputs.
-// It handles the construction of the StoryRun object.
-func (c *Client) TriggerStory(ctx context.Context, inputs map[string]interface{}) (*runsv1alpha1.StoryRun, error) {
-	// Marshal the inputs map into a RawExtension.
+func (c *Client) TriggerStory(ctx context.Context, storyName string, inputs map[string]interface{}) (*runsv1alpha1.StoryRun, error) {
 	inputBytes, err := json.Marshal(inputs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal inputs: %w", err)
 	}
 
 	storyRun := &runsv1alpha1.StoryRun{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Namespace:    c.namespace,
-			GenerateName: fmt.Sprintf("%s-", c.storyName),
+			GenerateName: fmt.Sprintf("%s-", storyName),
 		},
 		Spec: runsv1alpha1.StoryRunSpec{
 			StoryRef: refs.StoryReference{
 				ObjectReference: refs.ObjectReference{
-					Name: c.storyName,
+					Name: storyName,
 				},
 			},
 			Inputs: &runtime.RawExtension{Raw: inputBytes},
 		},
 	}
 
-	if err := c.kubeClient.Create(ctx, storyRun); err != nil {
+	if err := c.Create(ctx, storyRun); err != nil {
 		return nil, fmt.Errorf("failed to create storyrun: %w", err)
 	}
 	return storyRun, nil
+}
+
+func (c *Client) PatchStatus(ctx context.Context, name string, obj client.Object, patch client.Patch) error {
+	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: c.namespace}, obj); err != nil {
+		return fmt.Errorf("failed to get object '%s': %w", name, err)
+	}
+	if err := c.Status().Patch(ctx, obj, patch); err != nil {
+		return fmt.Errorf("failed to patch status for object '%s': %w", name, err)
+	}
+	return nil
 }
 
 // getPodNamespace gets the namespace of the pod where this code is running.

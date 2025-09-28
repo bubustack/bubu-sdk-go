@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/bubustack/bubu-sdk-go/impulse"
+	"github.com/bubustack/bubu-sdk-go/k8s"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -94,7 +94,7 @@ type BatchEngram[C any, I any] interface {
 // It is generic over the configuration type `C`.
 type Impulse[C any] interface {
 	Engram[C]
-	Run(ctx context.Context, client *impulse.Client) error
+	Run(ctx context.Context, client *k8s.Client) error
 }
 
 // StreamingEngram is for long-running, real-time data processing tasks.

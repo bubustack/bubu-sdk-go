@@ -219,7 +219,11 @@ func (sm *StorageManager) dehydrateValue(ctx context.Context, value interface{},
 		return nil, fmt.Errorf("failed to marshal stored object wrapper: %w", err)
 	}
 
-	filePath := filepath.Join("outputs", stepRunID, fmt.Sprintf("%s.json", keyPrefix))
+	fileName := fmt.Sprintf("%s.json", keyPrefix)
+	if keyPrefix == "" {
+		fileName = "output.json"
+	}
+	filePath := filepath.Join("outputs", stepRunID, fileName)
 	if err := sm.store.Write(ctx, filePath, bytes.NewReader(finalPayload)); err != nil {
 		return nil, fmt.Errorf("failed to write offloaded value for key '%s': %w", keyPrefix, err)
 	}

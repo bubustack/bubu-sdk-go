@@ -13,40 +13,21 @@ import (
 
 	"log/slog"
 
+	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	bobravozgrpcproto "github.com/bubustack/bobravoz-grpc/proto"
 	"github.com/bubustack/bubu-sdk-go/engram"
-	"github.com/bubustack/bubu-sdk-go/impulse"
+	"github.com/bubustack/bubu-sdk-go/k8s"
 	"github.com/bubustack/bubu-sdk-go/runtime"
+	"github.com/bubustack/bubu-sdk-go/storage"
 	"go.opentelemetry.io/otel"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // === Batch Execution ===
-
-// Run is the main entry point for a batch-based Engram.
-// It initializes the SDK runtime and handles the lifecycle of a job-based execution.
-func Run[C any, I any](ctx context.Context, e engram.BatchEngram[C, I]) error {
-	fmt.Println("Initializing Bubu SDK for batch execution...")
-	r, err := runtime.New[C, I](e)
-	if err != nil {
-		return fmt.Errorf("failed to initialize SDK runtime: %w", err)
-	}
-
-	// This is the new input handling logic.
-	// It's kept separate from the runtime for now to support both dynamic and static inputs.
-	inputs := make(map[string]interface{})
-	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
-		if err := json.Unmarshal([]byte(inputsStr), &inputs); err != nil {
-			return fmt.Errorf("failed to unmarshal BUBU_INPUTS: %w", err)
-		}
-	}
-
-	// The runtime's Execute method will need to be updated to accept the inputs.
-	// For now, we'll assume a conceptual ExecuteWithInputs method exists.
-	// This will be part of the larger SDK refactor.
-	return r.Execute(ctx, inputs)
-}
 
 func asStreamingEngram[C any](e engram.Engram[C]) (engram.StreamingEngram[C], bool) {
 	se, ok := e.(engram.StreamingEngram[C])
@@ -86,11 +67,11 @@ func Start[C any](ctx context.Context, engram engram.Engram[C]) error {
 func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 	// Simplified initialization, bypassing the complex generic runtime for now.
 	// This would evolve into a more complete non-generic runtime.
-	execCtxData, err := runtime.LoadExecutionContextData("/var/run/bubu/context.json")
+	execCtxData, err := runtime.LoadExecutionContextData()
 	if err != nil {
 		return fmt.Errorf("failed to load execution context: %w", err)
 	}
-	config, err := unmarshalFromMap[C](execCtxData.Config) // Using 'C' for config
+	config, err := runtime.UnmarshalFromMap[C](execCtxData.Config) // Using 'C' for config
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
@@ -103,6 +84,11 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 		return fmt.Errorf("engram initialization failed: %w", err)
 	}
 
+	sm, err := storage.NewManager(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create storage manager: %w", err)
+	}
+
 	inputs := make(map[string]interface{})
 	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
 		if err := json.Unmarshal([]byte(inputsStr), &inputs); err != nil {
@@ -110,7 +96,13 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 		}
 	}
 
-	result, err := e.Process(ctx, execCtx, inputs)
+	// Hydrate inputs to resolve any storage references before processing.
+	hydratedInputs, err := sm.Hydrate(ctx, inputs)
+	if err != nil {
+		return fmt.Errorf("failed to hydrate inputs: %w", err)
+	}
+
+	result, err := e.Process(ctx, execCtx, hydratedInputs)
 	if err != nil {
 		return fmt.Errorf("engram processing failed: %w", err)
 	}
@@ -118,8 +110,40 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 		return fmt.Errorf("engram returned an error: %w", result.Error)
 	}
 
-	// Omitting output handling for brevity, but it would be here.
-	return nil
+	return patchStepRunStatus(ctx, sm, execCtxData, result)
+}
+
+func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtxData *runtime.ExecutionContextData, result *engram.Result) error {
+	// Handle the output: dehydrate if necessary and patch the StepRun status.
+	output, err := sm.Dehydrate(ctx, result.Data, execCtxData.StoryInfo.StepRunID)
+	if err != nil {
+		return fmt.Errorf("failed to dehydrate output: %w", err)
+	}
+
+	outputBytes, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("failed to marshal output: %w", err)
+	}
+
+	k8sClient, err := k8s.NewClient()
+	if err != nil {
+		return fmt.Errorf("failed to create k8s client: %w", err)
+	}
+
+	rawOutputs := &k8sruntime.RawExtension{Raw: outputBytes}
+	patchJSON, err := json.Marshal(map[string]interface{}{
+		"status": map[string]interface{}{
+			"outputs": rawOutputs,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch: %w", err)
+	}
+
+	stepRun := &runsv1alpha1.StepRun{}
+	patch := client.RawPatch(types.MergePatchType, patchJSON)
+
+	return k8sClient.PatchStatus(ctx, execCtxData.StoryInfo.StepRunID, stepRun, patch)
 }
 
 // getExecutionMode determines the execution mode from an environment variable.
@@ -139,13 +163,13 @@ func getExecutionMode() string {
 func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 	fmt.Println("Initializing Bubu SDK for Impulse execution...")
 
-	execCtxData, err := runtime.LoadExecutionContextData("/var/run/bubu/context.json")
+	execCtxData, err := runtime.LoadExecutionContextData()
 	if err != nil {
 		return fmt.Errorf("failed to load execution context: %w", err)
 	}
 
 	// Unmarshal config.
-	config, err := unmarshalFromMap[C](execCtxData.Config)
+	config, err := runtime.UnmarshalFromMap[C](execCtxData.Config)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
@@ -155,32 +179,13 @@ func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 		return fmt.Errorf("impulse initialization failed: %w", err)
 	}
 
-	if execCtxData.StoryRef == nil || execCtxData.StoryRef.Name == "" {
-		return fmt.Errorf("impulse context is missing required 'storyRef.name' field")
-	}
-	storyName := execCtxData.StoryRef.Name
-
-	impulseClient, err := impulse.NewClient(storyName)
+	k8sClient, err := k8s.NewClient()
 	if err != nil {
-		return fmt.Errorf("failed to create impulse client: %w", err)
+		return fmt.Errorf("failed to create k8s client: %w", err)
 	}
 
 	fmt.Println("Starting Impulse...")
-	return i.Run(ctx, impulseClient)
-}
-
-// unmarshalFromMap is a helper to convert a map[string]interface{} to a struct
-// by going through JSON.
-func unmarshalFromMap[T any](data map[string]interface{}) (T, error) {
-	var target T
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return target, fmt.Errorf("failed to marshal map for unmarshaling: %w", err)
-	}
-	if err := json.Unmarshal(bytes, &target); err != nil {
-		return target, fmt.Errorf("failed to unmarshal into target struct: %w", err)
-	}
-	return target, nil
+	return i.Run(ctx, k8sClient)
 }
 
 // === Streaming Execution ===
@@ -246,13 +251,13 @@ func (s *server) Process(stream bobravozgrpcproto.Hub_ProcessServer) error {
 func StartStreamServer[C any](ctx context.Context, e engram.StreamingEngram[C]) error {
 	fmt.Println("Initializing Bubu SDK for streaming execution...")
 
-	execCtxData, err := runtime.LoadExecutionContextData("/var/run/bubu/context.json")
+	execCtxData, err := runtime.LoadExecutionContextData()
 	if err != nil {
 		return fmt.Errorf("failed to load execution context: %w", err)
 	}
 
 	// Unmarshal config.
-	config, err := unmarshalFromMap[C](execCtxData.Config)
+	config, err := runtime.UnmarshalFromMap[C](execCtxData.Config)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
