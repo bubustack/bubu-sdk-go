@@ -183,32 +183,41 @@ func (sm *StorageManager) dehydrateValue(ctx context.Context, value interface{},
 	case []interface{}:
 		// For now, we treat slices as atomic units. If a slice is too large, the whole thing is offloaded.
 		// A future enhancement could be to selectively dehydrate large elements within a slice.
-	}
-
-	// 2. For primitive types (or slices treated as a whole), check the size.
-	var rawData []byte
-	var contentType string
-
-	// Determine the content type. If it's a simple string, treat it as raw.
-	// Otherwise, marshal it as JSON. This is key for handling non-JSON text correctly.
-	if str, ok := value.(string); ok {
-		contentType = "raw"
-		// The data for a raw string needs to be a JSON-encoded string.
-		rawData = []byte(fmt.Sprintf(`"%s"`, str))
-	} else {
-		contentType = "json"
-		b, err := json.Marshal(value)
+		marshaledSlice, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal slice for size check: %w", err)
+		}
+		if len(marshaledSlice) <= sm.maxInlineSize {
+			return v, nil
+		}
+		return sm.offloadValue(ctx, marshaledSlice, "json", stepRunID, keyPrefix)
+	case string:
+		// For strings, we also check size and potentially store them externally.
+		if len(v) > sm.maxInlineSize {
+			// The data for a raw string needs to be a JSON-encoded string.
+			marshaledString, err := json.Marshal(v)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal raw string for storage: %w", err)
+			}
+			return sm.offloadValue(ctx, marshaledString, "raw", stepRunID, keyPrefix)
+		}
+		return v, nil
+	default:
+		// For any other type, we marshal it to see its size.
+		bytes, err := json.Marshal(v)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal value for size check: %w", err)
 		}
-		rawData = b
+		if len(bytes) <= sm.maxInlineSize {
+			return value, nil // Value is small enough, return as-is.
+		}
+		return sm.offloadValue(ctx, bytes, "json", stepRunID, keyPrefix)
 	}
+}
 
-	if len(rawData) <= sm.maxInlineSize {
-		return value, nil // Value is small enough, return as-is.
-	}
-
-	// 3. If the value is too large, wrap it in our StoredObject and offload it.
+// offloadValue handles the process of wrapping a value in a StoredObject,
+// writing it to the storage backend, and returning a storage reference.
+func (sm *StorageManager) offloadValue(ctx context.Context, rawData []byte, contentType, stepRunID, keyPrefix string) (interface{}, error) {
 	storedObj := StoredObject{
 		ContentType: contentType,
 		Data:        json.RawMessage(rawData),
