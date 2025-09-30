@@ -12,6 +12,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/bubustack/bobrapet/pkg/refs"
@@ -37,7 +38,22 @@ type Client struct {
 func NewClient() (*Client, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+		// Fallback to KUBECONFIG for local development.
+		kubeconfigPath := os.Getenv("KUBECONFIG")
+		if kubeconfigPath == "" {
+			// Default kubeconfig path
+			home, _ := os.UserHomeDir()
+			kubeconfigPath = fmt.Sprintf("%s/.kube/config", home)
+		}
+		if _, statErr := os.Stat(kubeconfigPath); statErr == nil {
+			if cfg, buildErr := clientcmd.BuildConfigFromFlags("", kubeconfigPath); buildErr == nil {
+				config = cfg
+			} else {
+				return nil, fmt.Errorf("failed to build kubeconfig from %s: %w", kubeconfigPath, buildErr)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to get in-cluster config and no kubeconfig at %s: %w", kubeconfigPath, err)
+		}
 	}
 
 	kubeClient, err := client.New(config, client.Options{
@@ -101,6 +117,12 @@ func (c *Client) PatchStepRunStatus(ctx context.Context, stepRunName string, pat
 
 // getPodNamespace gets the namespace of the pod where this code is running.
 func getPodNamespace() string {
+	if ns, ok := os.LookupEnv("BUBU_TARGET_STORY_NAMESPACE"); ok && ns != "" {
+		return ns
+	}
+	if ns, ok := os.LookupEnv("BUBU_IMPULSE_NAMESPACE"); ok && ns != "" {
+		return ns
+	}
 	if ns, ok := os.LookupEnv("BUBU_STEPRUN_NAMESPACE"); ok && ns != "" {
 		return ns
 	}

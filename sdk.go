@@ -54,12 +54,8 @@ func Start[C any](ctx context.Context, engram engram.Engram[C]) error {
 		// This will require refactoring StartStreamServer to not be generic or to handle 'any'.
 		return StartStreamServer(ctx, streamingEngram)
 	default: // "batch" is the default
-		batchEngram, ok := asBatchEngram(engram)
-		if !ok {
-			return fmt.Errorf("engram does not support batch mode")
-		}
-		// This Run function will be a simplified version for dynamic inputs.
-		return runBatch(ctx, batchEngram)
+		// For batch mode, use sdk.Run[C,I] with your specific input type.
+		return fmt.Errorf("batch mode requires using sdk.Run[C, I](ctx, yourBatchEngram); Start only supports streaming mode")
 	}
 }
 
@@ -160,15 +156,8 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 		return fmt.Errorf("failed to create storage manager: %w", err)
 	}
 
-	inputs := make(map[string]interface{})
-	if inputsStr := os.Getenv("BUBU_INPUTS"); inputsStr != "" {
-		if err := json.Unmarshal([]byte(inputsStr), &inputs); err != nil {
-			return fmt.Errorf("failed to unmarshal BUBU_INPUTS: %w", err)
-		}
-	}
-
-	// Hydrate inputs to resolve any storage references before processing.
-	hydratedInputs, err := sm.Hydrate(ctx, inputs)
+	// Use inputs from execution context, then hydrate to resolve any storage references.
+	hydratedInputs, err := sm.Hydrate(ctx, execCtxData.Inputs)
 	if err != nil {
 		return fmt.Errorf("failed to hydrate inputs: %w", err)
 	}
@@ -178,21 +167,21 @@ func runBatch[C any](ctx context.Context, e engram.BatchEngram[C, any]) error {
 		// If the process function itself errors, we create a synthetic result
 		// to pass to the patch function.
 		result = &engram.Result{Error: err}
-		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, enums.PhaseFailed)
 		return fmt.Errorf("engram processing failed: %w (patch error: %v)", err, patchErr)
 	}
 	if result.Error != nil {
-		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, "Failed")
+		patchErr := patchStepRunStatus(ctx, sm, execCtxData, result, enums.PhaseFailed)
 		if patchErr != nil {
 			return fmt.Errorf("engram returned an error: %w (patch error: %v)", result.Error, patchErr)
 		}
 		return fmt.Errorf("engram returned an error: %w", result.Error)
 	}
 
-	return patchStepRunStatus(ctx, sm, execCtxData, result, "Succeeded")
+	return patchStepRunStatus(ctx, sm, execCtxData, result, enums.PhaseSucceeded)
 }
 
-func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtxData *runtime.ExecutionContextData, result *engram.Result, phase string) error {
+func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtxData *runtime.ExecutionContextData, result *engram.Result, phase enums.Phase) error {
 	// Handle the output: dehydrate if necessary and patch the StepRun status.
 	output, err := sm.Dehydrate(ctx, result.Data, execCtxData.StoryInfo.StepRunID)
 	if err != nil {
@@ -211,7 +200,7 @@ func patchStepRunStatus(ctx context.Context, sm *storage.StorageManager, execCtx
 
 	finishedAt := metav1.Now()
 	newStatus := runsv1alpha1.StepRunStatus{
-		Phase:      enums.Phase(phase),
+		Phase:      phase,
 		Output:     &k8sruntime.RawExtension{Raw: outputBytes},
 		FinishedAt: &finishedAt,
 		Duration:   finishedAt.Sub(execCtxData.StartedAt.Time).String(),
@@ -233,6 +222,24 @@ func getExecutionMode() string {
 	return mode
 }
 
+// === Story Helpers ===
+
+// StartStory starts a StoryRun for the given story name with the provided inputs.
+// It resolves the target namespace from the operator-provided environment (e.g.,
+// BUBU_TARGET_STORY_NAMESPACE / BUBU_IMPULSE_NAMESPACE) via k8s client defaults.
+func StartStory(ctx context.Context, storyName string, inputs map[string]interface{}) (*runsv1alpha1.StoryRun, error) {
+	k8sClient, err := k8s.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create k8s client: %w", err)
+	}
+	return k8sClient.TriggerStory(ctx, storyName, inputs)
+}
+
+// StartStoryRun is an alias of StartStory for API clarity.
+func StartStoryRun(ctx context.Context, storyName string, inputs map[string]interface{}) (*runsv1alpha1.StoryRun, error) {
+	return StartStory(ctx, storyName, inputs)
+}
+
 // === Impulse Execution ===
 
 // RunImpulse is the main entry point for an Impulse.
@@ -244,6 +251,16 @@ func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 	execCtxData, err := runtime.LoadExecutionContextData()
 	if err != nil {
 		return fmt.Errorf("failed to load execution context: %w", err)
+	}
+
+	// If provided, merge BUBU_IMPULSE_WITH JSON into config before unmarshaling.
+	if withStr := os.Getenv("BUBU_IMPULSE_WITH"); withStr != "" {
+		var withMap map[string]interface{}
+		if err := json.Unmarshal([]byte(withStr), &withMap); err == nil {
+			for k, v := range withMap {
+				execCtxData.Config[k] = v
+			}
+		}
 	}
 
 	// Unmarshal config.
@@ -360,7 +377,18 @@ func StartStreamServer[C any](ctx context.Context, e engram.StreamingEngram[C]) 
 	bobravozgrpcproto.RegisterHubServer(s, &server{handler: e.Stream})
 
 	log.Printf("gRPC server listening at %v", lis.Addr())
-	return s.Serve(lis)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- s.Serve(lis)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.GracefulStop()
+		return ctx.Err()
+	case err := <-serveErr:
+		return err
+	}
 }
 
 // StreamTo connects to a downstream gRPC server and streams data to it.
