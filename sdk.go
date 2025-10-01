@@ -1,3 +1,8 @@
+// package sdk provides the primary entry points for executing bobrapet components.
+// It contains the runtime logic that bootstraps an Engram or Impulse, injects
+// the necessary context from the environment, and manages its lifecycle.
+// Developers will typically only interact with the `Run`, `RunImpulse`, or
+// `StartStreamServer` functions in this package from their `main.go` file.
 package sdk
 
 import (
@@ -54,14 +59,25 @@ func Start[C any](ctx context.Context, engram engram.Engram[C]) error {
 		// This will require refactoring StartStreamServer to not be generic or to handle 'any'.
 		return StartStreamServer(ctx, streamingEngram)
 	default: // "batch" is the default
-		// For batch mode, use sdk.Run[C,I] with your specific input type.
-		return fmt.Errorf("batch mode requires using sdk.Run[C, I](ctx, yourBatchEngram); Start only supports streaming mode")
+		batchEngram, ok := asBatchEngram(engram)
+		if !ok {
+			return fmt.Errorf("engram does not support batch mode, but execution mode is 'batch'")
+		}
+		return runBatch(ctx, batchEngram)
 	}
 }
 
-// Run is the main entry point for batch workflows (Kubernetes Job mode).
-// It initializes the SDK runtime, unmarshals the Engram config and inputs into
-// their respective generic types, executes the engram, and patches the StepRun status.
+// Run is the main entry point for BatchEngrams, which are designed to execute
+// as short-lived, transactional tasks (typically Kubernetes Jobs).
+//
+// This function orchestrates the entire lifecycle of a batch execution:
+//  1. It loads the execution context (config, secrets, inputs) from environment variables.
+//  2. It initializes the storage manager for transparent data offloading.
+//  3. It hydrates inputs, resolving any references to data in external storage.
+//  4. It unmarshals the configuration and inputs into the developer-defined generic types.
+//  5. It calls the Engram's `Init` and `Process` methods.
+//  6. It captures the result, dehydrates the output if necessary, and patches the
+//     StepRun resource in Kubernetes with the final status (`Succeeded` or `Failed`).
 func Run[C any, I any](ctx context.Context, e engram.BatchEngram[C, I]) error {
 	execCtxData, err := runtime.LoadExecutionContextData()
 	if err != nil {
@@ -224,9 +240,12 @@ func getExecutionMode() string {
 
 // === Story Helpers ===
 
-// StartStory starts a StoryRun for the given story name with the provided inputs.
-// It resolves the target namespace from the operator-provided environment (e.g.,
-// BUBU_TARGET_STORY_NAMESPACE / BUBU_IMPULSE_NAMESPACE) via k8s client defaults.
+// StartStory triggers a new StoryRun for a given Story. This is the primary
+// mechanism for programmatically initiating workflows, typically used from within
+// an Impulse.
+//
+// The SDK's Kubernetes client automatically resolves the correct namespace,
+// allowing the caller to simply provide the name of the Story to run.
 func StartStory(ctx context.Context, storyName string, inputs map[string]interface{}) (*runsv1alpha1.StoryRun, error) {
 	k8sClient, err := k8s.NewClient()
 	if err != nil {
@@ -242,9 +261,16 @@ func StartStoryRun(ctx context.Context, storyName string, inputs map[string]inte
 
 // === Impulse Execution ===
 
-// RunImpulse is the main entry point for an Impulse.
-// It initializes the SDK runtime and handles the lifecycle of a long-running
-// event listener.
+// RunImpulse is the main entry point for an Impulse, which is a long-running
+// service designed to listen for external events and trigger StoryRuns.
+//
+// This function orchestrates the initialization of an Impulse:
+//  1. It loads the execution context, focusing on configuration and secrets.
+//  2. It unmarshals the configuration into the developer-defined generic type.
+//  3. It calls the Impulse's `Init` method for one-time setup.
+//  4. It provides a pre-configured Kubernetes client to the `Run` method.
+//  5. It then transfers control to the Impulse's `Run` method, which is expected
+//     to block and manage the long-running process.
 func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 	fmt.Println("Initializing Bubu SDK for Impulse execution...")
 
@@ -341,8 +367,15 @@ func (s *server) Process(stream bobravozgrpcproto.Hub_ProcessServer) error {
 	return <-errChan
 }
 
-// StartStreamServer is the main entry point for a streaming Engram.
-// It initializes the SDK runtime and handles the lifecycle of a long-running service.
+// StartStreamServer is the main entry point for a StreamingEngram. This function
+// bootstraps a long-running service that can process data in real-time over gRPC.
+//
+// This function orchestrates the lifecycle of a streaming service:
+// 1. It loads the execution context for configuration and secrets.
+// 2. It calls the StreamingEngram's `Init` method.
+// 3. It starts a gRPC server on the configured port.
+// 4. It registers the StreamingEngram's `Stream` method as the gRPC handler.
+// 5. It gracefully handles server shutdown on context cancellation.
 func StartStreamServer[C any](ctx context.Context, e engram.StreamingEngram[C]) error {
 	fmt.Println("Initializing Bubu SDK for streaming execution...")
 

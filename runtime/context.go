@@ -9,6 +9,7 @@ import (
 
 	"github.com/bubustack/bobrapet/pkg/refs"
 	"github.com/bubustack/bubu-sdk-go/engram"
+	"github.com/mitchellh/mapstructure"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -82,15 +83,23 @@ func LoadExecutionContextData() (*ExecutionContextData, error) {
 }
 
 // UnmarshalFromMap is a helper to convert a map[string]interface{} to a struct
-// by going through JSON.
+// using mapstructure for efficient and robust conversion.
 func UnmarshalFromMap[T any](data map[string]interface{}) (T, error) {
 	var target T
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		return target, fmt.Errorf("failed to marshal map for unmarshaling: %w", err)
+	config := &mapstructure.DecoderConfig{
+		// This enables the decoder to handle type conversions automatically,
+		// for example, converting a string "123" to an int 123.
+		WeaklyTypedInput: true,
+		Result:           &target,
 	}
-	if err := json.Unmarshal(bytes, &target); err != nil {
-		return target, fmt.Errorf("failed to unmarshal into target struct: %w", err)
+
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return target, fmt.Errorf("failed to create mapstructure decoder: %w", err)
+	}
+
+	if err := decoder.Decode(data); err != nil {
+		return target, fmt.Errorf("failed to decode map into target struct: %w", err)
 	}
 	return target, nil
 }
