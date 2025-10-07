@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GOFLAGS: "-mod=readonly -trimpath"
+  GOTOOLCHAIN: "auto"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Pin the linter version used inside the action (adjust as you prefer)
+          # See https://github.com/golangci/golangci-lint/releases
+          version: v2.4.0
+          args: --timeout=5m
+
+  # ---------- Verify module & formatting ----------
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Verify go.mod and go.sum (tidy must be clean)
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Check formatting (no writes)
+        run: |
+          OUT="$(gofmt -s -l .)"
+          if [ -n "$OUT" ]; then
+            echo "Files need 'gofmt -s':"
+            echo "$OUT"
+            exit 1
+          fi
+
+  # ---------- Unit tests with coverage ----------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, verify]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Go env
+        run: go env
+
+      - name: Download deps
+        run: go mod download
+
+      - name: Run tests (race, shuffle, coverage)
+        run: |
+          go test -v -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage report (enforce threshold)
+        run: |
+          go tool cover -func=coverage.out
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          thr=70
+          echo "Total Coverage: ${total}% (threshold ${thr}%)"
+          awk -v t="$total" -v thr="$thr" 'BEGIN{ if (t+0 < thr+0) { exit 1 } }' || {
+            echo "Coverage below threshold"; exit 1; }
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage.out
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+      # Upload to Codecov using OIDC (no token). For forked PRs this will be skipped.
+      - name: Upload to Codecov (OIDC)
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          use_oidc: true
+          flags: unittests
+          fail_ci_if_error: false
+          verbose: true
+
+  # ---------- actionlint (lint this workflow) ----------
+  workflow-lint:
+    name: Workflow Lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          reporter: github-pr-check
+          level: error
+
+  # ---------- Commit message lint (Conventional Commits) ----------
+  commit-lint:
+    name: Lint Commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history for range detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: commitlint
+        uses: wagoid/commitlint-github-action@v6

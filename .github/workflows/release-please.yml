@@ -1,0 +1,84 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          # If you want CI to run on the Release PRs, set a PAT here:
+          token: ${{ secrets.RELEASE_PLEASE_PAT }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+      # Only runs when a new GitHub Release/tag was created by release-please
+      - name: Checkout code
+        if: ${{ steps.release.outputs.release_created }}
+        uses: actions/checkout@v4
+
+      - name: Set up Go (from go.mod)
+        if: ${{ steps.release.outputs.release_created }}
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'   # tracks your module’s declared toolchain
+
+      - name: Run tests
+        if: ${{ steps.release.outputs.release_created }}
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        if: ${{ steps.release.outputs.release_created }}
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.out
+          # For private repos or protected branches you likely need a token:
+          # token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Verify module tidy state
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Trigger pkg.go.dev indexing
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          VERSION=${{ steps.release.outputs.tag_name }}
+          echo "Triggering pkg.go.dev to index version $VERSION"
+          curl -sSf "https://proxy.golang.org/github.com/bubustack/bubu-sdk-go/@v/${VERSION}.info" || true
+          # Optional: also poke sum.golang.org:
+          # curl -sSf "https://sum.golang.org/lookup/github.com/bubustack/bubu-sdk-go@${VERSION}" || true
+
+      - name: Create release summary
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          {
+            echo "## Release ${{ steps.release.outputs.tag_name }} 🚀"
+            echo
+            echo "The new version has been released and is available at:"
+            echo "- **GitHub**: https://github.com/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag_name }}"
+            echo "- **pkg.go.dev**: https://pkg.go.dev/github.com/bubustack/bubu-sdk-go@${{ steps.release.outputs.tag_name }}"
+            echo
+            echo "### Installation"
+            echo '```bash'
+            echo "go get github.com/bubustack/bubu-sdk-go@${{ steps.release.outputs.tag_name }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
