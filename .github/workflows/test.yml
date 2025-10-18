@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.go-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.24.x']
+        os: [ubuntu-latest, ubuntu-24.04-arm64, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+          cache: true
+
+      - name: Run tests
+        run: make test
+
+      - name: Run race detector
+        if: startsWith(matrix.os, 'ubuntu') && matrix.go-version == '1.24.x'
+        run: go test -race ./...
+
+  envtest:
+    name: Envtest ${{ matrix.k8s-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm64]
+        k8s-version: ['1.26.x', '1.27.x', '1.28.x', '1.29.x', '1.30.x', '1.31.x']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+          check-latest: true
+          cache: true
+
+      - name: Setup envtest assets
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          ARCH=amd64
+          if [[ "${{ matrix.os }}" == *"arm64"* ]]; then
+            ARCH=arm64
+          fi
+          KUBEBUILDER_ASSETS=$($(go env GOPATH)/bin/setup-envtest use -p path --arch "${ARCH}" --os linux ${{ matrix.k8s-version }})
+          echo "KUBEBUILDER_ASSETS=$KUBEBUILDER_ASSETS" >> "$GITHUB_ENV"
+
+      - name: Run envtest smoke tests
+        run: go test -tags=integration ./integration/...
