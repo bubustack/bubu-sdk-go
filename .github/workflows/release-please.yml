@@ -33,7 +33,7 @@ jobs:
       # Only runs when a new GitHub Release/tag was created by release-please
       - name: Checkout code
         if: ${{ steps.release.outputs.release_created }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up Go (from go.mod)
         if: ${{ steps.release.outputs.release_created }}
