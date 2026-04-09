@@ -20,6 +20,9 @@ package metrics
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"sync"
 
 	"github.com/bubustack/bubu-sdk-go/pkg/observability"
@@ -59,95 +62,157 @@ var (
 )
 
 func init() {
-	if !observability.MetricsEnabled() {
-		metricsDisabled = true
-		return
+	if err := initializeMetrics(); err != nil {
+		log.Printf("bubu sdk: metrics disabled during initialization: %v", err)
 	}
+}
 
-	meter = otel.Meter("bubu-sdk")
+func initializeMetrics() error {
+	if !observability.MetricsEnabled() {
+		disableMetrics()
+		return nil
+	}
+	return initializeMetricsWithMeter(otel.Meter("bubu-sdk"))
+}
 
+func initializeMetricsWithMeter(m metric.Meter) error {
+	resetMetricInstruments()
+	meter = m
+	metricsDisabled = false
+
+	var errs []error
 	var err error
 	hydrationSizeBytes, err = meter.Int64Histogram(
 		"bubu.storage.hydration.size_bytes",
 		metric.WithDescription("Size of hydrated data in bytes"),
 		metric.WithUnit("By"),
 	)
-	_ = err
-	// If instrument creation fails, continue without panicking
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.storage.hydration.size_bytes: %w", err))
+	}
 
 	dehydrationSizeBytes, err = meter.Int64Histogram(
 		"bubu.storage.dehydration.size_bytes",
 		metric.WithDescription("Size of dehydrated data in bytes"),
 		metric.WithUnit("By"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.storage.dehydration.size_bytes: %w", err))
+	}
 
 	streamThroughput, err = meter.Int64Counter(
 		"bubu.stream.messages_total",
 		metric.WithDescription("Total messages processed in stream"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.messages_total: %w", err))
+	}
 
 	k8sOperationDuration, err = meter.Float64Histogram(
 		"bubu.k8s.operation.duration_seconds",
 		metric.WithDescription("Duration of Kubernetes API operations"),
 		metric.WithUnit("s"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.k8s.operation.duration_seconds: %w", err))
+	}
 
 	// Reconnect attempt/failure counters for streaming client
 	streamReconnectAttempts, err = meter.Int64Counter(
 		"bubu.stream.reconnect.attempts_total",
 		metric.WithDescription("Total reconnect attempts by SDK client"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.reconnect.attempts_total: %w", err))
+	}
 	streamReconnectFailures, err = meter.Int64Counter(
 		"bubu.stream.reconnect.failures_total",
 		metric.WithDescription("Total reconnect failures (terminal) by SDK client"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.reconnect.failures_total: %w", err))
+	}
 
 	// Client buffer: size/bytes gauges are registered by the buffer with callbacks
 	clientBufferDrops, err = meter.Int64Counter(
 		"bubu.stream.client_buffer.dropped_total",
 		metric.WithDescription("Total messages dropped by SDK client buffer (oversize/overflow)"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.client_buffer.dropped_total: %w", err))
+	}
 	clientBufferFlushes, err = meter.Int64Counter(
 		"bubu.stream.client_buffer.flushed_total",
 		metric.WithDescription("Total messages flushed from SDK client buffer after reconnect"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.client_buffer.flushed_total: %w", err))
+	}
 
 	clientBufferAdds, err = meter.Int64Counter(
 		"bubu.stream.client_buffer.added_total",
 		metric.WithDescription("Total messages added to SDK client buffer due to transient errors"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.client_buffer.added_total: %w", err))
+	}
 
 	streamBackpressureTimeouts, err = meter.Int64Counter(
 		"bubu.stream.backpressure.timeouts_total",
 		metric.WithDescription("Total timeouts encountered while delivering stream messages due to backpressure"),
 	)
-	_ = err
+	if err != nil {
+		errs = append(errs, fmt.Errorf("create bubu.stream.backpressure.timeouts_total: %w", err))
+	}
+
+	if len(errs) > 0 {
+		disableMetrics()
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+func disableMetrics() {
+	resetMetricInstruments()
+	meter = metricnoop.NewMeterProvider().Meter("bubu-sdk")
+	metricsDisabled = true
+}
+
+func resetMetricInstruments() {
+	var (
+		int64Histogram    metric.Int64Histogram
+		int64Counter      metric.Int64Counter
+		float64Histogram  metric.Float64Histogram
+		float64Observable metric.Float64ObservableGauge
+	)
+	hydrationSizeBytes = int64Histogram
+	dehydrationSizeBytes = int64Histogram
+	streamThroughput = int64Counter
+	k8sOperationDuration = float64Histogram
+	clientBufferAdds = int64Counter
+	clientBufferSizeGauge = float64Observable
+	clientBufferBytesGauge = float64Observable
+	clientBufferDrops = int64Counter
+	clientBufferFlushes = int64Counter
+	streamReconnectAttempts = int64Counter
+	streamReconnectFailures = int64Counter
+	streamBackpressureTimeouts = int64Counter
 }
 
 // RecordHydrationSize records the size of hydrated data for observability.
-func RecordHydrationSize(ctx context.Context, sizeBytes int64, stepRunID string) {
+func RecordHydrationSize(ctx context.Context, sizeBytes int64) {
 	if metricsDisabled {
 		return
 	}
-	hydrationSizeBytes.Record(ctx, sizeBytes,
-		metric.WithAttributes(attribute.String("steprun_id", stepRunID)))
+	hydrationSizeBytes.Record(ctx, sizeBytes)
 }
 
 // RecordDehydrationSize records the size of dehydrated data for observability.
-func RecordDehydrationSize(ctx context.Context, sizeBytes int64, stepRunID string) {
+func RecordDehydrationSize(ctx context.Context, sizeBytes int64) {
 	if metricsDisabled {
 		return
 	}
-	dehydrationSizeBytes.Record(ctx, sizeBytes,
-		metric.WithAttributes(attribute.String("steprun_id", stepRunID)))
+	dehydrationSizeBytes.Record(ctx, sizeBytes)
 }
 
 // RecordStreamMessage increments the stream message counter.
@@ -210,14 +275,24 @@ func RegisterClientBufferGauges(sizeFn func() float64, bytesFn func() float64) f
 	}
 }
 
+// observeClientBufferSizes iterates all registered client buffer size
+// callbacks under an RLock and records their values via the provided OTel
+// observer (`pkg/metrics/metrics.go:179-223`).
 func observeClientBufferSizes(_ context.Context, obs metric.Float64Observer) error {
 	clientBufferObserversMu.RLock()
 	defer clientBufferObserversMu.RUnlock()
-	for _, fn := range clientBufferSizeObservers {
+	for id, fn := range clientBufferSizeObservers {
 		if fn == nil {
 			continue
 		}
-		obs.Observe(fn())
+		func(observerID int64, sizeFn func() float64) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("bubu sdk: client buffer size callback %d panicked: %v", observerID, r)
+				}
+			}()
+			obs.Observe(sizeFn())
+		}(id, fn)
 	}
 	return nil
 }
@@ -225,11 +300,18 @@ func observeClientBufferSizes(_ context.Context, obs metric.Float64Observer) err
 func observeClientBufferBytes(_ context.Context, obs metric.Float64Observer) error {
 	clientBufferObserversMu.RLock()
 	defer clientBufferObserversMu.RUnlock()
-	for _, fn := range clientBufferBytesObservers {
+	for id, fn := range clientBufferBytesObservers {
 		if fn == nil {
 			continue
 		}
-		obs.Observe(fn())
+		func(observerID int64, bytesFn func() float64) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("bubu sdk: client buffer bytes callback %d panicked: %v", observerID, r)
+				}
+			}()
+			obs.Observe(bytesFn())
+		}(id, fn)
 	}
 	return nil
 }
@@ -317,7 +399,14 @@ func Gauge(name, description, unit string, callback func() float64) error {
 		metric.WithDescription(description),
 		metric.WithUnit(unit),
 		metric.WithFloat64Callback(func(_ context.Context, obs metric.Float64Observer) error {
-			obs.Observe(callback())
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("bubu sdk: gauge %q callback panicked: %v", name, r)
+					}
+				}()
+				obs.Observe(callback())
+			}()
 			return nil
 		}))
 	return err

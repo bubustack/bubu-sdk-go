@@ -14,45 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package env provides small helpers for parsing validated environment
+// overrides used across the SDK runtime.
 package env
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// GetWithFallback gets a trimmed environment variable, trying the primary key first and then the fallback key.
-func GetWithFallback(primaryKey, fallbackKey string) string {
-	if val := strings.TrimSpace(os.Getenv(primaryKey)); val != "" {
-		return val
+// GetDuration parses a duration from an environment variable, returning defaultValue if unset or invalid.
+func GetDuration(key string, defaultValue time.Duration) time.Duration {
+	valStr := strings.TrimSpace(os.Getenv(key))
+	if valStr == "" {
+		return defaultValue
 	}
-	return strings.TrimSpace(os.Getenv(fallbackKey))
+	val, err := time.ParseDuration(valStr)
+	if err != nil || val <= 0 {
+		slog.Warn("ignoring invalid env var duration, using default",
+			"key", key, "value", valStr, "default", defaultValue)
+		return defaultValue
+	}
+	return val
 }
 
-// GetDurationWithFallback parses a duration from an environment variable, with a fallback key and a default value.
-func GetDurationWithFallback(primaryKey, fallbackKey string, defaultValue time.Duration) time.Duration {
-	valStr := GetWithFallback(primaryKey, fallbackKey)
-	if val, err := time.ParseDuration(valStr); err == nil && val > 0 {
-		return val
+// GetInt parses an integer from an environment variable, returning defaultValue if unset or invalid.
+func GetInt(key string, defaultValue int) int {
+	valStr := strings.TrimSpace(os.Getenv(key))
+	if valStr == "" {
+		return defaultValue
 	}
-	return defaultValue
-}
-
-// GetIntWithFallback parses an integer from an environment variable, with a fallback key and a default value.
-func GetIntWithFallback(primaryKey, fallbackKey string, defaultValue int) int {
-	valStr := GetWithFallback(primaryKey, fallbackKey)
-	if val, err := strconv.Atoi(valStr); err == nil && val > 0 {
-		return val
+	val, err := strconv.Atoi(valStr)
+	if err != nil || val <= 0 {
+		slog.Warn("ignoring invalid env var integer, using default",
+			"key", key, "value", valStr, "default", defaultValue)
+		return defaultValue
 	}
-	return defaultValue
-}
-
-// GetEnvWithFallback gets an environment variable by key, returning a fallback if not set.
-func GetEnvWithFallback(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
+	return val
 }

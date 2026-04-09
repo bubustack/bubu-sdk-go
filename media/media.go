@@ -1,7 +1,11 @@
+// Package media provides helpers for offloading large streaming payloads to
+// shared object storage while keeping small payloads inline.
 package media
 
 import (
 	"context"
+	crypto_rand "crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path"
@@ -10,26 +14,35 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobrapet/pkg/storage"
+	"github.com/bubustack/core/contracts"
 )
 
 const defaultInlineLimit = 48 * 1024 // 48 KiB keeps short bursts inline for real-time UX
 
 // StorageReference describes an object persisted to the shared storage backend.
 type StorageReference struct {
-	Path        string `json:"path"`
+	// Path is the object path inside the configured shared storage backend.
+	Path string `json:"path"`
+	// ContentType is the MIME type recorded for the stored object.
 	ContentType string `json:"contentType,omitempty"`
-	SizeBytes   int    `json:"sizeBytes,omitempty"`
+	// SizeBytes is the stored blob size when known.
+	SizeBytes int `json:"sizeBytes,omitempty"`
 }
 
 // WriteOptions control how object paths are composed when offloading payloads.
 type WriteOptions struct {
-	Namespace   string
-	StoryRun    string
-	Step        string
-	Scope       []string
+	// Namespace scopes the object path to the owning runtime namespace.
+	Namespace string
+	// StoryRun scopes the object path to the owning StoryRun.
+	StoryRun string
+	// Step scopes the object path to the owning step.
+	Step string
+	// Scope appends additional caller-defined path segments.
+	Scope []string
+	// ContentType records the MIME type written for the object.
 	ContentType string
+	// InlineLimit overrides the default inline/offload threshold.
 	InlineLimit int
 }
 
@@ -103,7 +116,7 @@ func buildPath(opts WriteOptions, ts time.Time) string {
 		}
 	}
 	segments = append(segments, ts.Format("2006/01/02"))
-	filename := fmt.Sprintf("%d-%06d.bin", ts.Unix(), ts.Nanosecond()/1000)
+	filename := fmt.Sprintf("%d-%06d-%s.bin", ts.Unix(), ts.Nanosecond()/1000, randHexSuffix(4))
 	segments = append(segments, filename)
 	return path.Join(segments...)
 }
@@ -124,6 +137,12 @@ func sanitizeSegment(raw string) string {
 		cleaned = cleaned[:64]
 	}
 	return strings.ToLower(cleaned)
+}
+
+func randHexSuffix(n int) string {
+	b := make([]byte, n)
+	_, _ = crypto_rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func firstNonEmpty(values ...string) string {

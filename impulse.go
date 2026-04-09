@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/bubustack/bobrapet/pkg/storage"
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/k8s"
 	"github.com/bubustack/bubu-sdk-go/runtime"
@@ -29,7 +30,7 @@ import (
 //
 // This function infers config type C from the impulse implementation, providing compile-time
 // type safety. It orchestrates the complete lifecycle:
-//  1. Load execution context from environment (BUBU_CONFIG, BUBU_INPUTS, etc.)
+//  1. Load execution context from environment (BUBU_STEP_CONFIG, BUBU_TRIGGER_DATA, etc.)
 //  2. Unmarshal config into type C
 //  3. Call impulse.Init with typed config and secrets
 //  4. Create pre-configured Kubernetes client with namespace resolution
@@ -67,6 +68,8 @@ import (
 //	    }
 //	}
 func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
+	ctx, _ = withDefaultLogger(ctx)
+	defer publishCapturedLogs(ctx)
 	logger := LoggerFromContext(ctx)
 	logger.Info("Initializing Bubu SDK for Impulse execution")
 
@@ -76,14 +79,27 @@ func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 	}
 	logExecutionContextDebug(logger, execCtxData)
 
+	sm, err := storage.SharedManager(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create storage manager: %w", err)
+	}
+	configMap, err := hydrateConfig(ctx, sm, execCtxData.Config, execCtxData.CELContext)
+	if err != nil {
+		return fmt.Errorf("failed to hydrate config: %w", err)
+	}
 	// Unmarshal config.
-	config, err := runtime.UnmarshalFromMap[C](execCtxData.Config)
+	config, err := runtime.UnmarshalFromMap[C](configMap)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
-	secrets := engram.NewSecrets(ctx, execCtxData.Secrets)
+	secrets, err := engram.NewSecretsWithError(ctx, execCtxData.Secrets)
+	if err != nil {
+		return fmt.Errorf("failed to expand secrets: %w", err)
+	}
 
-	if err := i.Init(ctx, config, secrets); err != nil {
+	if err := callWithPanicRecoveryNoValue("impulse Init", func() error {
+		return i.Init(ctx, config, secrets)
+	}); err != nil {
 		return fmt.Errorf("impulse initialization failed: %w", err)
 	}
 
@@ -93,5 +109,10 @@ func RunImpulse[C any](ctx context.Context, i engram.Impulse[C]) error {
 	}
 
 	logger.Info("Starting Impulse")
-	return i.Run(ctx, k8sClient)
+	if err := callWithPanicRecoveryNoValue("impulse Run", func() error {
+		return i.Run(ctx, k8sClient)
+	}); err != nil {
+		return fmt.Errorf("impulse execution failed: %w", err)
+	}
+	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,12 +28,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobrapet/pkg/enums"
 	"github.com/bubustack/bobrapet/pkg/storage"
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/k8s"
 	"github.com/bubustack/bubu-sdk-go/runtime"
+	"github.com/bubustack/core/contracts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -58,6 +59,22 @@ func (m *MockBatchEngram[C, I]) Process(
 
 type timeoutEngram struct{}
 
+func TestWithTriggerToken_AllowsNilContextAndStoresToken(t *testing.T) {
+	ctx := WithTriggerToken(nil, "token-123") //nolint:staticcheck
+	if ctx == nil {
+		t.Fatal("expected context when attaching token to nil context")
+	}
+	if got := TriggerTokenFromContext(ctx); got != "token-123" {
+		t.Fatalf("TriggerTokenFromContext() = %q, want %q", got, "token-123")
+	}
+}
+
+func TestWithTriggerToken_EmptyTokenPreservesNilContext(t *testing.T) {
+	if got := WithTriggerToken(nil, ""); got != nil { //nolint:staticcheck
+		t.Fatalf("expected nil context passthrough for empty token, got %#v", got)
+	}
+}
+
 func (timeoutEngram) Init(ctx context.Context, config struct{}, secrets *engram.Secrets) error {
 	return nil
 }
@@ -71,6 +88,66 @@ func (timeoutEngram) Process(
 	return nil, ctx.Err()
 }
 
+type timeoutSuccessEngram struct{}
+
+func (timeoutSuccessEngram) Init(ctx context.Context, config struct{}, secrets *engram.Secrets) error {
+	return nil
+}
+
+func (timeoutSuccessEngram) Process(
+	ctx context.Context,
+	execCtx *engram.ExecutionContext,
+	inputs struct{},
+) (*engram.Result, error) {
+	<-ctx.Done()
+	return &engram.Result{Data: "late-success"}, nil
+}
+
+type panicProcessEngram struct{}
+
+func (panicProcessEngram) Init(ctx context.Context, config struct{}, secrets *engram.Secrets) error {
+	return nil
+}
+
+func (panicProcessEngram) Process(
+	ctx context.Context,
+	execCtx *engram.ExecutionContext,
+	inputs struct{},
+) (*engram.Result, error) {
+	panic(errors.New("process boom"))
+}
+
+type secretExpansionInitTrackingEngram struct {
+	initCalled bool
+}
+
+func (e *secretExpansionInitTrackingEngram) Init(
+	ctx context.Context,
+	config struct{},
+	secrets *engram.Secrets,
+) error {
+	e.initCalled = true
+	return nil
+}
+
+func (e *secretExpansionInitTrackingEngram) Process(
+	ctx context.Context,
+	execCtx *engram.ExecutionContext,
+	inputs struct{},
+) (*engram.Result, error) {
+	return engram.NewResultFrom("ok"), nil
+}
+
+func TestCallWithPanicRecoveryNoValue_ConvertsPanicsToErrors(t *testing.T) {
+	cause := errors.New("boom")
+	err := callWithPanicRecoveryNoValue("test component", func() error {
+		panic(cause)
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "test component panicked")
+	assert.True(t, errors.Is(err, cause))
+}
+
 func TestRun_Success_NoBridge(t *testing.T) {
 	// Setup environment
 	err := os.Setenv(contracts.StoryNameEnv, "test-story")
@@ -78,6 +155,10 @@ func TestRun_Success_NoBridge(t *testing.T) {
 		t.Fatalf("Setenv() error = %v", err)
 	}
 	err = os.Setenv(contracts.StepRunNameEnv, "test-step-run")
+	if err != nil {
+		t.Fatalf("Setenv() error = %v", err)
+	}
+	err = os.Setenv(contracts.StepRunNamespaceEnv, "default")
 	if err != nil {
 		t.Fatalf("Setenv() error = %v", err)
 	}
@@ -93,6 +174,12 @@ func TestRun_Success_NoBridge(t *testing.T) {
 			t.Fatalf("Unsetenv() error = %v", err)
 		}
 	}()
+	defer func() {
+		err = os.Unsetenv(contracts.StepRunNamespaceEnv)
+		if err != nil {
+			t.Fatalf("Unsetenv() error = %v", err)
+		}
+	}()
 
 	// Mocks
 	mockEngram := &MockBatchEngram[map[string]any, any]{}
@@ -103,7 +190,7 @@ func TestRun_Success_NoBridge(t *testing.T) {
 	mockEngram.On("Init", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	mockEngram.On("Process", mock.Anything, mock.Anything, mock.Anything).Return(&engram.Result{Data: "success"}, nil)
 	mockSM.On("Hydrate", mock.Anything, mock.Anything).Return(map[string]any{}, nil)
-	mockSM.On("Dehydrate", mock.Anything, "success", "test-step-run").Return("dehydrated", nil)
+	mockSM.On("Dehydrate", mock.Anything, "success", storage.NamespacedKey("default", "test-step-run")).Return("dehydrated", nil) //nolint:lll
 	mockK8s.On("PatchStepRunStatus", mock.Anything, "test-step-run", mock.Anything).Return(nil)
 
 	// Disable bridge
@@ -210,10 +297,110 @@ func TestRunWithClientsTimeoutForcesExitCode(t *testing.T) {
 	mockK8s.AssertExpectations(t)
 }
 
+func TestRunWithClientsTimeoutSuccessStillForcesExitCode(t *testing.T) {
+	t.Setenv(contracts.StepTimeoutEnv, "1ms")
+
+	execCtxData := &runtime.ExecutionContextData{
+		Inputs:  map[string]any{},
+		Config:  map[string]any{},
+		Secrets: map[string]string{},
+		StoryInfo: engram.StoryInfo{
+			StoryName:        "timeout-story",
+			StoryRunID:       "story-run",
+			StepName:         "step",
+			StepRunID:        "step-run",
+			StepRunNamespace: "default",
+		},
+		StartedAt: metav1.Now(),
+	}
+
+	mockK8s := &k8s.MockClient{}
+	mockK8s.On("PatchStepRunStatus", mock.Anything, "step-run",
+		mock.MatchedBy(func(status runsv1alpha1.StepRunStatus) bool {
+			return status.ExitCode == 124 &&
+				status.ExitClass == enums.ExitClassRetry &&
+				status.Phase == enums.PhaseTimeout
+		}),
+	).Return(nil)
+
+	originalExit := exitProcess
+	defer func() { exitProcess = originalExit }()
+
+	var (
+		exitCalled bool
+		exitCode   int
+	)
+	exitProcess = func(code int) {
+		exitCalled = true
+		exitCode = code
+	}
+
+	err := runWithClientsWithContext(context.Background(), timeoutSuccessEngram{}, mockK8s, noopStorageManager{}, execCtxData) //nolint:lll
+	if err == nil {
+		t.Fatalf("expected timeout error")
+	}
+	assert.True(t, errors.Is(err, ErrBatchTimeout))
+	assert.True(t, exitCalled, "expected exitProcess to be invoked")
+	assert.Equal(t, 124, exitCode)
+
+	mockK8s.AssertExpectations(t)
+}
+
+func TestRunWithClients_ProcessPanicPatchesStatus(t *testing.T) {
+	execCtxData := &runtime.ExecutionContextData{
+		Inputs:  map[string]any{},
+		Config:  map[string]any{},
+		Secrets: map[string]string{},
+		StoryInfo: engram.StoryInfo{
+			StoryName:        "panic-story",
+			StoryRunID:       "story-run",
+			StepName:         "step",
+			StepRunID:        "step-run",
+			StepRunNamespace: "default",
+		},
+		StartedAt: metav1.Now(),
+	}
+
+	mockK8s := &k8s.MockClient{}
+	mockK8s.On("PatchStepRunStatus", mock.Anything, "step-run",
+		mock.MatchedBy(func(status runsv1alpha1.StepRunStatus) bool {
+			return status.Phase == enums.PhaseFailed &&
+				status.ExitCode == 1 &&
+				strings.Contains(status.LastFailureMsg, "panicked")
+		}),
+	).Return(nil)
+
+	err := runWithClientsWithContext(context.Background(), panicProcessEngram{}, mockK8s, noopStorageManager{}, execCtxData) //nolint:lll
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "panicked")
+
+	mockK8s.AssertExpectations(t)
+}
+
+func TestInitializeEngramFailsOnSecretExpansionError(t *testing.T) {
+	missingDir := filepath.Join(t.TempDir(), "missing")
+	eng := &secretExpansionInitTrackingEngram{}
+
+	err := initializeEngram[struct{}, struct{}](
+		context.Background(),
+		eng,
+		noopStorageManager{},
+		&runtime.ExecutionContextData{
+			Config:  map[string]any{},
+			Secrets: map[string]string{"db": "file:" + missingDir},
+		},
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to expand secrets")
+	assert.Contains(t, err.Error(), `secret "db" (file)`)
+	assert.NotContains(t, err.Error(), missingDir)
+	assert.False(t, eng.initCalled, "Init should not run when secret expansion fails")
+}
+
 func TestHandleResultAndPatchStatus(t *testing.T) {
 	ctx := context.Background()
 	execCtxData := &runtime.ExecutionContextData{
-		StoryInfo: engram.StoryInfo{StepRunID: "step-1"},
+		StoryInfo: engram.StoryInfo{StepRunID: "step-1", StepRunNamespace: "default"},
 	}
 	processErr := errors.New("process error")
 	patchErr := errors.New("patch error")
@@ -276,7 +463,12 @@ func TestHandleResultAndPatchStatus(t *testing.T) {
 			mockK8s := new(k8s.MockClient)
 
 			if tt.expectDehydrate {
-				mockSM.On("Dehydrate", ctx, mock.Anything, execCtxData.StoryInfo.StepRunID).Return(mock.Anything, tt.dehydrateErr)
+				mockSM.On(
+					"Dehydrate",
+					mock.Anything,
+					mock.Anything,
+					storage.NamespacedKey(execCtxData.StoryInfo.StepRunNamespace, execCtxData.StoryInfo.StepRunID),
+				).Return(mock.Anything, tt.dehydrateErr)
 			}
 			if tt.expectPatch {
 				mockK8s.On("PatchStepRunStatus", ctx, execCtxData.StoryInfo.StepRunID, mock.Anything).Return(tt.patchErr)

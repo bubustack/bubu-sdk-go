@@ -78,14 +78,14 @@ func TestNewStreamMessageTrimsKind(t *testing.T) {
 func TestWithJSONPayloadCopies(t *testing.T) {
 	payload := []byte(`{"a":1}`)
 	msg := NewStreamMessage("payload", WithJSONPayload(payload))
-	payload[0] = '{'
+	payload[0] = '!'
 	require.Equal(t, []byte(`{"a":1}`), msg.Payload)
 }
 
 func TestWithInputsCopies(t *testing.T) {
 	inputs := []byte(`{"b":2}`)
 	msg := NewStreamMessage("inputs", WithInputs(inputs))
-	inputs[0] = '{'
+	inputs[0] = '!'
 	require.Equal(t, []byte(`{"b":2}`), msg.Inputs)
 }
 

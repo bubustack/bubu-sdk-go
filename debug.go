@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bubu-sdk-go/runtime"
+	"github.com/bubustack/core/contracts"
 )
 
 const debugPreviewLimit = 2048
@@ -86,12 +86,6 @@ func logExecutionContextDebug(logger *slog.Logger, data *runtime.ExecutionContex
 	}
 	if len(data.Secrets) > 0 {
 		attrs = append(attrs, secretKeysAttr("secretKeys", data.Secrets))
-	}
-	if len(data.RequestedManifest) > 0 {
-		attrs = append(attrs,
-			slog.Int("requestedManifest", len(data.RequestedManifest)),
-			debugPreviewAttr("manifestPreview", data.RequestedManifest),
-		)
 	}
 	if data.Storage != nil {
 		attrs = append(attrs, slog.String("storageProvider", data.Storage.Provider))

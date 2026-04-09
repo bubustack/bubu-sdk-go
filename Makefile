@@ -5,10 +5,6 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-# Force Go 1.25.1 to ensure a stable, known-good toolchain.
-# This avoids system-level installation issues and makes builds reproducible.
-export BUBU_TOOLCHAIN_PATH=go1.25.1
-
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -32,7 +28,7 @@ all: build
 
 .PHONY: help
 help: ## Display this help.
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Development
 
@@ -46,7 +42,7 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: fmt vet ## Run tests with race detector.
-	go test ./... -race
+	go test -race ./...
 
 .PHONY: test-integration
 test-integration: ## Run envtest smoke tests (requires KUBEBUILDER_ASSETS)
@@ -56,6 +52,10 @@ test-integration: ## Run envtest smoke tests (requires KUBEBUILDER_ASSETS)
 test-coverage: ## Run tests with coverage profile.
 	go test -coverprofile=coverage.out ./...
 	@echo "Coverage profile written to coverage.out"
+
+.PHONY: vulncheck
+vulncheck: govulncheck ## Run govulncheck against the module.
+	$(GOVULNCHECK) ./...
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -91,18 +91,30 @@ clean: ## Clean build and coverage artifacts
 ## Location to install dependencies to
 LOCALBIN ?= $(shell pwd)/bin
 $(LOCALBIN):
-	mkdir -p $(LOCALBIN)
-	
+	mkdir -p "$(LOCALBIN)"
+
 ## Tool Binaries
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOVULNCHECK = $(LOCALBIN)/govulncheck
 
 ## Tool Versions
-GOLANGCI_LINT_VERSION ?= v2.4.0
+GOLANGCI_LINT_VERSION ?= v2.11.4
+GOVULNCHECK_VERSION ?= v1.1.4
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+	@test -f .custom-gcl.yml && { \
+		echo "Building custom golangci-lint with plugins..." && \
+		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
+	} || true
+
+.PHONY: govulncheck
+govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
+$(GOVULNCHECK): $(LOCALBIN)
+	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -113,9 +125,9 @@ define go-install-tool
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
-rm -f $(1) ;\
-GOBIN=$(LOCALBIN) go install $${package} ;\
-mv $(1) $(1)-$(3) ;\
+rm -f "$(1)" ;\
+GOBIN="$(LOCALBIN)" go install $${package} ;\
+mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
-ln -sf $$(realpath $(1)-$(3)) $(1)
+ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
 endef

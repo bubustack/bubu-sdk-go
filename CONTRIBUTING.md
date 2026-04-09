@@ -1,64 +1,60 @@
-# Contributing to bobravoz-grpc (transport operator)
+# Contributing to bubu-sdk-go
 
-First off, thank you for considering contributing. Your help is appreciated.
+The Go SDK powers every Engram and Impulse in BubuStack. Thanks for helping us keep it reliable, ergonomic, and production-ready.
 
-This document provides guidelines for contributing to the sdk and its docs. Please read it carefully to ensure a smooth collaboration process.
+## Reporting bugs
 
-## How Can I Contribute?
+- Check [existing issues](https://github.com/bubustack/bubu-sdk-go/issues?q=is%3Aissue) first.
+- Include the following details when filing a bug:
+  - Engram/Impulse name and execution mode (batch, streaming, impulse) using the SDK.
+  - Minimal code sample or `Story` snippet that reproduces the issue.
+  - SDK version (tag/commit), Kubernetes version, and controller versions you tested with.
+  - Logs with `BUBU_DEBUG=true`, including stack traces or transport payloads if relevant.
+- Apply the `kind/bug`, appropriate `area/*`, and `priority/*` labels when triaging.
 
-### Reporting Bugs
+## Requesting enhancements
 
-- **Ensure the bug was not already reported** by searching on GitHub under [Issues](https://github.com/bubustack/bubu-sdk-go/issues).
-- If you're unable to find an open issue addressing the problem, [open a new one](https://github.com/bubustack/bubu-sdk-go/issues/new). Be sure to include a **title and clear description**, as much relevant information as possible, and a **code sample** or an **executable test case** demonstrating the expected behavior that is not occurring.
+- Use the [feature request template](https://github.com/bubustack/bubu-sdk-go/issues/new?template=feature_request.md).
+- Describe the workflow or scale constraint that motivates the change, and outline the desired API (interfaces, config structs, helper functions).
+- If the change spans other repos (operators, Engram templates), open an org-level discussion so we can coordinate releases.
 
-### Suggesting Enhancements
+## Pull requests
 
-- Open a new issue to discuss your enhancement. Clearly describe the proposed enhancement and its benefits.
-- Provide code snippets, mockups, or diagrams to illustrate your idea.
+1. Fork the repo, branch from `main`, and keep the PR focused.
+2. Follow existing package boundaries (`batch`, `stream`, `impulse`, `runtime`, etc.); avoid introducing new dependencies without discussion.
+3. Run the quality gates before requesting review:
+   ```bash
+   make lint             # golangci-lint (downloaded to ./bin)
+   make test             # fmt + vet + go test ./... -race
+   make test-integration # optional envtest smoke tests (requires KUBEBUILDER_ASSETS)
+   make test-coverage    # optional coverage profile
+   make tidy             # keep go.mod/go.sum clean
+   ```
+4. Update docs/examples/README when you add new APIs or change behaviour. Mention whether bobrapet/operator updates are required.
+5. Use the PR template to record commands executed, test evidence, and linked issues (e.g., `Fixes #123`).
 
-### Pull Requests
-
-- Fork the repository and create your branch from `main`.
-- Ensure the test suite passes: `make test` (envtest will be installed automatically).
-- Lint: `make lint` (golangci-lint via ./bin).
-- Submit the pull request.
-
-## Development Workflow
+## Development workflow
 
 ### Prerequisites
 
-- Go 1.24+
-- Docker
-- `make`
+- Go 1.26+ (matching `go.mod`).
+- `make`, bash, and optionally Docker (only required for building sample binaries/images).
 
 ### Setup
 
-1.  Fork the repository.
-2.  Clone your fork: `git clone https://github.com/your_username/bubu-sdk-go.git`
-3.  Navigate to the repository directory: `cd bubu-sdk-go`
-4.  Build: `make build`
+1. Fork the repository and clone your fork.
+2. `cd bubu-sdk-go`
+3. `make help` to explore targets grouped by category.
+4. `make lint-config` verifies the golangci-lint configuration if needed.
 
-### Running Tests
+### Running tests
 
 ```bash
-# Run all tests
-make test
+make test             # fmt + vet + go test ./... -race
+make test-integration # optional envtest-backed suite
 ```
 
-### Commit Message Conventions
+### Commit style & Code of Conduct
 
-We follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification. This allows for automated changelog generation and semantic versioning.
-
-Examples:
-- `feat: Add support for custom retry policies`
-- `fix: Correctly handle nil inputs in Process`
-- `docs: Update README with new quickstart`
-- `chore: Upgrade to Go 1.24`
-
-### Code of Conduct
-
-Participation in this project is governed by the
-[Contributor Covenant Code of Conduct](./CODE_OF_CONDUCT.md). By participating,
-you are expected to uphold this code. Please report unacceptable behavior to
-conduct@bubustack.com.
-
+- Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) so changelog automation works (e.g., `feat: add structured message helper`, `fix: guard nil transport envelope`).
+- Participation in this project is governed by the [Contributor Covenant Code of Conduct](./CODE_OF_CONDUCT.md). Report unacceptable behaviour to [conduct@bubustack.com](mailto:conduct@bubustack.com) or via the org Discussions moderation channel.

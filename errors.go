@@ -23,17 +23,23 @@ import (
 )
 
 // ErrBatchTimeout is a sentinel used with errors.Is to detect batch timeouts.
-var (
-	ErrBatchTimeout           = errors.New("bubu batch execution timed out")
-	ErrStoryRunNotFound       = errors.New("storyrun not found")
-	ErrImpulseSessionExists   = errors.New("impulse session already active")
-	ErrImpulseSessionNotFound = errors.New("impulse session not found")
-)
+var ErrBatchTimeout = errors.New("bubu batch execution timed out")
+
+// ErrStoryRunNotFound indicates that a requested StoryRun could not be located.
+var ErrStoryRunNotFound = errors.New("storyrun not found")
+
+// ErrImpulseSessionExists indicates that a dispatcher session key is already active.
+var ErrImpulseSessionExists = errors.New("impulse session already active")
+
+// ErrImpulseSessionNotFound indicates that a dispatcher session key has no active session.
+var ErrImpulseSessionNotFound = errors.New("impulse session not found")
 
 // BatchTimeoutError conveys that a batch engram exceeded its configured timeout.
 type BatchTimeoutError struct {
+	// Timeout is the configured duration limit that was exceeded.
 	Timeout time.Duration
-	Cause   error
+	// Cause is the underlying timeout-related error, when one is available.
+	Cause error
 }
 
 // Error implements the error interface.

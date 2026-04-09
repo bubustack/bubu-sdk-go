@@ -1,20 +1,19 @@
 name: Tests
 
 on:
-  push:
-  pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Go ${{ matrix.go-version }} on ${{ matrix.os }}
+  go-test:
+    name: Go 1.26.x on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.24.x']
         os: [ubuntu-latest, ubuntu-24.04-arm64, macos-latest]
     steps:
       - name: Checkout
@@ -23,21 +22,93 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: '1.26.x'
           check-latest: true
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Run tests
         run: make test
 
-      - name: Run race detector
-        if: startsWith(matrix.os, 'ubuntu') && matrix.go-version == '1.24.x'
-        run: go test -race ./...
+  race-and-coverage:
+    name: Race and coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run race detector with coverage
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage.out
+          path: coverage.out
+
+  govulncheck:
+    name: Govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: |
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  api-compat:
+    name: API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install gorelease
+        run: go install golang.org/x/exp/cmd/gorelease@latest
+
+      - name: Run API compatibility check
+        run: |
+          git fetch --tags --force
+          if git tag --list 'v*' | grep -q .; then
+            "$(go env GOPATH)/bin/gorelease"
+          else
+            echo "No release tags found; skipping API compatibility bootstrap check."
+          fi
 
   envtest:
     name: Envtest ${{ matrix.k8s-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    needs: test
+    needs: go-test
     strategy:
       fail-fast: false
       matrix:
@@ -50,9 +121,10 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.x'
           check-latest: true
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Setup envtest assets
         run: |

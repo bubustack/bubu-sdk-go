@@ -18,6 +18,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/stretchr/testify/mock"
 
@@ -41,7 +42,11 @@ func (m *MockClient) TriggerStory(
 ) (*runsv1alpha1.StoryRun, error) {
 	args := m.Called(ctx, storyName, storyNamespace, inputs)
 	if sr := args.Get(0); sr != nil {
-		return sr.(*runsv1alpha1.StoryRun), args.Error(1)
+		typed, ok := sr.(*runsv1alpha1.StoryRun)
+		if !ok {
+			return nil, fmt.Errorf("mock TriggerStory expected *runsv1alpha1.StoryRun, got %T", sr)
+		}
+		return typed, args.Error(1)
 	}
 	return nil, args.Error(1)
 }

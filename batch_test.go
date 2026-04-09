@@ -21,11 +21,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
+	coretransport "github.com/bubustack/core/runtime/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -86,7 +88,7 @@ func Test_bridgeToHubSkipsWithoutBinding(t *testing.T) {
 }
 
 func Test_bridgeToHubDialFailure(t *testing.T) {
-	t.Setenv(contracts.TransportBindingEnv, `{"binding":{"driver":"demo","endpoint":"dial-fail"}}`)
+	t.Setenv(contracts.TransportBindingEnv, `{"binding":{"driver":"demo","endpoint":"dial-fail","protocolVersion":"`+coretransport.ProtocolVersion+`"}}`) //nolint:lll
 	original := connectorDial
 	connectorDial = func(
 		ctx context.Context,
@@ -189,4 +191,31 @@ func TestBuildHybridStreamMessageInputMarshalError(t *testing.T) {
 	}
 	_, err := buildHybridStreamMessage([]byte("x"), execCtx)
 	require.Error(t, err)
+}
+
+func TestTruncateErrorMessage(t *testing.T) {
+	long := strings.Repeat("x", 10000)
+	got := truncateErrorMessage(long, 8192)
+	if len(got) > 8192 {
+		t.Errorf("truncateErrorMessage should cap at 8192 bytes, got %d", len(got))
+	}
+	if len(got) != 8192 {
+		t.Errorf("truncateErrorMessage should use exactly 8192 bytes for input longer than limit, got %d", len(got))
+	}
+}
+
+func TestTruncateErrorMessage_ShortPassthrough(t *testing.T) {
+	msg := "short error"
+	got := truncateErrorMessage(msg, 8192)
+	if got != msg {
+		t.Errorf("truncateErrorMessage should return msg unchanged, got %q", got)
+	}
+}
+
+func TestTruncateErrorMessage_ZeroLimit(t *testing.T) {
+	msg := "some error"
+	got := truncateErrorMessage(msg, 0)
+	if got != msg {
+		t.Errorf("zero limit should return msg unchanged, got %q", got)
+	}
 }

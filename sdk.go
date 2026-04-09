@@ -64,14 +64,15 @@ import (
 	"log/slog"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/k8s"
 	sdkerrors "github.com/bubustack/bubu-sdk-go/pkg/errors"
+	"github.com/bubustack/core/contracts"
 )
 
 // ==== Logger injection via context ====
 type ctxLoggerKey struct{}
+type ctxLogCaptureKey struct{}
 
 // WithLogger stores a slog.Logger in the context for SDK use.
 //
@@ -112,13 +113,72 @@ func LoggerFromContext(ctx context.Context) *slog.Logger {
 	return newDefaultLogger()
 }
 
+func panicAsError(component string, recovered any) error {
+	label := strings.TrimSpace(component)
+	if label == "" {
+		label = "sdk component"
+	}
+	switch typed := recovered.(type) {
+	case error:
+		return fmt.Errorf("%s panicked: %w", label, typed)
+	case string:
+		return fmt.Errorf("%s panicked: %s", label, typed)
+	default:
+		return fmt.Errorf("%s panicked: %v", label, recovered)
+	}
+}
+
+func callWithPanicRecovery[T any](component string, fn func() (T, error)) (value T, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = panicAsError(component, recovered)
+		}
+	}()
+	return fn()
+}
+
+func callWithPanicRecoveryNoValue(component string, fn func() error) error {
+	_, err := callWithPanicRecovery(component, func() (struct{}, error) {
+		return struct{}{}, fn()
+	})
+	return err
+}
+
+func withDefaultLogger(ctx context.Context) (context.Context, *logCapture) { //nolint:unparam
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if l, ok := ctx.Value(ctxLoggerKey{}).(*slog.Logger); ok && l != nil {
+		return ctx, logCaptureFromContext(ctx)
+	}
+	logger, capture := newDefaultLoggerWithCapture()
+	ctx = context.WithValue(ctx, ctxLoggerKey{}, logger)
+	if capture != nil {
+		ctx = context.WithValue(ctx, ctxLogCaptureKey{}, capture)
+	}
+	return ctx, capture
+}
+
+func logCaptureFromContext(ctx context.Context) *logCapture {
+	if ctx == nil {
+		return nil
+	}
+	if c, ok := ctx.Value(ctxLogCaptureKey{}).(*logCapture); ok && c != nil {
+		return c
+	}
+	return nil
+}
+
 // WithTriggerToken attaches an idempotency token that StartStory passes through to the Kubernetes client.
 // When provided, the SDK derives deterministic StoryRun names without relying on process-wide env vars.
+// Nil contexts are accepted so callers can safely attach a token before choosing a base context.
 func WithTriggerToken(ctx context.Context, token string) context.Context {
-	if ctx == nil {
-		panic("sdk.WithTriggerToken requires a non-nil context")
-	}
 	return k8s.WithTriggerToken(ctx, token)
+}
+
+// TriggerTokenFromContext returns the trigger token stored in the context, if any.
+func TriggerTokenFromContext(ctx context.Context) string {
+	return k8s.TriggerTokenFromContext(ctx)
 }
 
 // K8sClient defines the interface for Kubernetes operations required by the SDK.
@@ -195,7 +255,15 @@ func Start[C any, I any](ctx context.Context, e DualEngram[C, I]) error {
 //   - Path traversal protection and validation
 //   - OpenTelemetry metrics for operation latency and data sizes
 //
-// Storage references use the format {"$bubuStorageRef": "outputs/steprun-id/path.json"}.
+// Storage references use one of the formats below:
+//   - {"$bubuStorageRef": "outputs/steprun-id/path.json"}
+//   - {"$bubuStorageRef": "outputs/steprun-id/path.json", "$bubuStoragePath":"result.text"}
+//   - {"$bubuConfigMapRef": "namespace/name:key"}
+//   - {"$bubuSecretRef": "namespace/name:key"}
+//   - {"$bubuConfigMapRef": {"name":"cfg","key":"payload","namespace":"ns","format":"json"}}
+//
+// Supported formats for ConfigMap/Secret refs: auto (default), json, raw.
+// When namespace is omitted, the SDK defaults to BUBU_POD_NAMESPACE/BUBU_STEPRUN_NAMESPACE.
 type StorageManager interface {
 	// Hydrate recursively scans a data structure for storage references and replaces
 	// them with the actual content from the storage backend. Returns the hydrated
@@ -209,6 +277,57 @@ type StorageManager interface {
 	// (potentially containing references) on success, or an error if writing fails.
 	// Respects context cancellation and enforces BUBU_STORAGE_TIMEOUT.
 	Dehydrate(ctx context.Context, data any, stepRunID string) (any, error)
+}
+
+// === Target Story Resolution ===
+
+// TargetStory holds the target story information resolved from the Impulse's storyRef.
+// This is set by the operator via environment variables.
+type TargetStory struct {
+	// Name is the Story name from Impulse.spec.storyRef.name.
+	Name string
+
+	// Namespace is the Story namespace from Impulse.spec.storyRef.namespace.
+	// Empty if the Story is in the same namespace as the Impulse.
+	Namespace string
+}
+
+// GetTargetStory returns the target story configured via the Impulse's spec.storyRef.
+// The operator injects these values as BUBU_TARGET_STORY_NAME and BUBU_TARGET_STORY_NAMESPACE
+// environment variables when running an Impulse pod.
+//
+// Returns an error if BUBU_TARGET_STORY_NAME is not set, as the Impulse CRD requires
+// a storyRef to be specified.
+//
+// Example:
+//
+//	target, err := sdk.GetTargetStory()
+//	if err != nil {
+//	    return fmt.Errorf("no target story configured: %w", err)
+//	}
+//	sr, err := sdk.StartStoryInNamespace(ctx, target.Name, target.Namespace, inputs)
+func GetTargetStory() (TargetStory, error) {
+	name := strings.TrimSpace(os.Getenv(contracts.TargetStoryNameEnv))
+	if name == "" {
+		return TargetStory{}, fmt.Errorf(
+			"target story not configured: %s environment variable is not set",
+			contracts.TargetStoryNameEnv,
+		)
+	}
+	return TargetStory{
+		Name:      name,
+		Namespace: strings.TrimSpace(os.Getenv(contracts.TargetStoryNamespaceEnv)),
+	}, nil
+}
+
+// MustGetTargetStory is like GetTargetStory but panics if the target story is not configured.
+// Useful in main() where early failure is preferred over error handling.
+func MustGetTargetStory() TargetStory {
+	target, err := GetTargetStory()
+	if err != nil {
+		panic(err)
+	}
+	return target
 }
 
 // === Story Helpers ===
@@ -253,7 +372,7 @@ func StartStoryInNamespace(
 	if ctx == nil {
 		return nil, fmt.Errorf("context must not be nil")
 	}
-	k8sClient, err := k8s.NewClient()
+	k8sClient, err := k8s.SharedClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create k8s client: %w", err)
 	}
@@ -295,12 +414,14 @@ func StopStory(ctx context.Context, storyRunName string) error {
 }
 
 // StopStoryInNamespace cancels an in-flight StoryRun by marking it finished.
-// If the StoryRun has already completed or does not exist, ErrStoryRunNotFound is returned.
+// If the StoryRun does not exist, ErrStoryRunNotFound is returned. Already-terminal
+// StoryRuns are treated as a no-op. Active StoryRuns in phases the SDK will not
+// force-finish return an invalid-transition error from the underlying k8s client.
 func StopStoryInNamespace(ctx context.Context, storyRunName, namespace string) error {
 	if ctx == nil {
 		return fmt.Errorf("context must not be nil")
 	}
-	k8sClient, err := k8s.NewClient()
+	k8sClient, err := k8s.SharedClient()
 	if err != nil {
 		return fmt.Errorf("failed to create k8s client: %w", err)
 	}
@@ -317,7 +438,7 @@ func StopStoryInNamespace(ctx context.Context, storyRunName, namespace string) e
 //
 // This function infers both config type C and input type I from the engram implementation,
 // providing full compile-time type safety. It orchestrates the complete lifecycle:
-//  1. Load execution context from environment (BUBU_CONFIG, BUBU_INPUTS, etc.)
+//  1. Load execution context from environment (BUBU_STEP_CONFIG, BUBU_TRIGGER_DATA, etc.)
 //  2. Unmarshal config and inputs into types C and I
 //  3. Call engram.Init with typed config and secrets
 //  4. Hydrate inputs from storage if needed
@@ -348,7 +469,7 @@ func StartBatch[C any, I any](ctx context.Context, e engram.BatchEngram[C, I]) e
 //
 // This function infers config type C from the engram implementation, providing compile-time
 // type safety. It orchestrates the complete lifecycle:
-//  1. Load execution context from environment (BUBU_CONFIG, etc.)
+//  1. Load execution context from environment (BUBU_STEP_CONFIG, etc.)
 //  2. Unmarshal config into type C
 //  3. Call engram.Init with typed config and secrets
 //  4. Start gRPC server on BUBU_GRPC_PORT (default 50051)

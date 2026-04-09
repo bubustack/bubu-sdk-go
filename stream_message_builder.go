@@ -2,18 +2,21 @@ package sdk
 
 import (
 	"encoding/json"
+	"maps"
 	"strings"
 	"time"
 
 	"github.com/bubustack/bubu-sdk-go/engram"
+	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 )
 
 // StreamMessageOption configures an engram.StreamMessage produced via NewStreamMessage.
 type StreamMessageOption func(*engram.StreamMessage)
 
 // NewStreamMessage constructs an engram.StreamMessage pre-populated with the provided options.
-// It trims the kind identifier and applies any options in order, enabling concise metadata-only
-// messages that still round-trip through the transport envelope.
+// It trims the kind identifier and applies any options in order. Note that metadata-only
+// messages are invalid at send time; at least one of audio/video/binary payloads, JSON payload,
+// inputs, or transports must be populated for the message to be published.
 func NewStreamMessage(kind string, opts ...StreamMessageOption) engram.StreamMessage {
 	msg := engram.StreamMessage{Kind: strings.TrimSpace(kind)}
 	for _, opt := range opts {
@@ -50,9 +53,7 @@ func WithMetadata(metadata map[string]string) StreamMessageOption {
 		if msg.Metadata == nil {
 			msg.Metadata = make(map[string]string, len(metadata))
 		}
-		for k, v := range metadata {
-			msg.Metadata[k] = v
-		}
+		maps.Copy(msg.Metadata, metadata)
 	}
 }
 
@@ -86,6 +87,16 @@ func WithTransports(descriptors []engram.TransportDescriptor) StreamMessageOptio
 		for i := range descriptors {
 			msg.Transports[i] = descriptors[i].Clone()
 		}
+	}
+}
+
+// WithStreamEnvelope attaches transport-layer stream sequencing metadata.
+func WithStreamEnvelope(env *transportpb.StreamEnvelope) StreamMessageOption {
+	return func(msg *engram.StreamMessage) {
+		if env == nil {
+			return
+		}
+		msg.Envelope = cloneStreamEnvelope(env)
 	}
 }
 

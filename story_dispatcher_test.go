@@ -107,6 +107,32 @@ func TestStoryDispatcher_DuplicateKey(t *testing.T) {
 	}
 }
 
+func TestStoryDispatcher_TriggerToken(t *testing.T) {
+	token := "token-123"
+	dispatcher := sdk.NewStoryDispatcher(
+		sdk.WithStoryRuntime(
+			func(ctx context.Context, storyName, storyNamespace string, inputs map[string]any) (*runsv1alpha1.StoryRun, error) {
+				if got := sdk.TriggerTokenFromContext(ctx); got != token {
+					t.Fatalf("TriggerTokenFromContext() = %q, want %q", got, token)
+				}
+				return &runsv1alpha1.StoryRun{
+					ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "default"},
+				}, nil
+			},
+			func(ctx context.Context, storyRunName, storyNamespace string) error { return nil },
+		),
+	)
+
+	ctx := context.Background()
+	_, err := dispatcher.Trigger(ctx, sdk.StoryTriggerRequest{
+		StoryName:    "demo",
+		TriggerToken: token,
+	})
+	if err != nil {
+		t.Fatalf("Trigger() failed: %v", err)
+	}
+}
+
 func TestStoryDispatcher_StopNotFound(t *testing.T) {
 	stopped := false
 	dispatcher := sdk.NewStoryDispatcher(

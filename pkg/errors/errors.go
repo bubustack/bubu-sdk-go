@@ -18,9 +18,17 @@ package errors
 
 import "errors"
 
-var (
-	ErrRetryable  = errors.New("retryable")
-	ErrConflict   = errors.New("conflict")
-	ErrNotFound   = errors.New("not found")
-	ErrNilContext = errors.New("nil context")
-)
+// ErrRetryable marks an operation failure as safe to retry.
+var ErrRetryable = errors.New("retryable")
+
+// ErrConflict marks an optimistic-concurrency or resource-version conflict.
+var ErrConflict = errors.New("conflict")
+
+// ErrNotFound marks that the requested resource or object does not exist.
+var ErrNotFound = errors.New("not found")
+
+// ErrNilContext marks that a required context argument was nil.
+var ErrNilContext = errors.New("nil context")
+
+// ErrInvalidTransition marks that a requested state transition is not allowed.
+var ErrInvalidTransition = errors.New("invalid phase transition")

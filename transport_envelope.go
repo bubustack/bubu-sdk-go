@@ -2,12 +2,16 @@ package sdk
 
 import (
 	"encoding/json"
+	"maps"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/tractatus/envelope"
 )
+
+const defaultEnvelopePayloadMIME = "application/json"
 
 func streamMessageEnvelope(msg engram.StreamMessage) *envelope.Envelope {
 	env := &envelope.Envelope{Version: envelope.LatestVersion}
@@ -106,7 +110,17 @@ func populateMessageFromEnvelope(msg *engram.StreamMessage, env *envelope.Envelo
 		msg.Metadata = cloneStringMap(env.Metadata)
 	}
 	if len(env.Payload) > 0 {
-		msg.Payload = copyBytes(env.Payload)
+		payloadCopy := copyBytes(env.Payload)
+		msg.Payload = payloadCopy
+		msg.Binary = &engram.BinaryFrame{
+			// Keep payload and binary payload mirrored without a second copy on
+			// the structured-envelope decode path.
+			Payload:  payloadCopy,
+			MimeType: defaultEnvelopePayloadMIME,
+		}
+		if env.TimestampMs > 0 {
+			msg.Binary.Timestamp = time.Duration(env.TimestampMs) * time.Millisecond
+		}
 	}
 	if len(env.Inputs) > 0 {
 		msg.Inputs = copyBytes(env.Inputs)
@@ -130,9 +144,7 @@ func cloneStringMap(src map[string]string) map[string]string {
 		return nil
 	}
 	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
+	maps.Copy(dst, src)
 	return dst
 }
 
@@ -148,17 +160,59 @@ func cloneConfigMap(src map[string]any) map[string]any {
 }
 
 func cloneConfigValue(v any) any {
-	switch typed := v.(type) {
-	case map[string]any:
-		return cloneConfigMap(typed)
-	case []any:
-		out := make([]any, len(typed))
-		for i := range typed {
-			out[i] = cloneConfigValue(typed[i])
+	if v == nil {
+		return nil
+	}
+	return cloneConfigReflectValue(reflect.ValueOf(v)).Interface()
+}
+
+func cloneConfigReflectValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneConfigReflectValue(value.Elem())
+		out := reflect.New(value.Type()).Elem()
+		out.Set(cloned)
+		return out
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.New(value.Type().Elem())
+		out.Elem().Set(cloneConfigReflectValue(value.Elem()))
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), cloneConfigReflectValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(cloneConfigReflectValue(value.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(cloneConfigReflectValue(value.Index(i)))
 		}
 		return out
 	default:
-		return typed
+		return value
 	}
 }
 

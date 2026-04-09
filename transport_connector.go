@@ -6,16 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bubu-sdk-go/pkg/observability"
+	"github.com/bubustack/core/contracts"
+	transportconnector "github.com/bubustack/core/runtime/transport/connector"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -31,7 +30,7 @@ const (
 // It dials the connector endpoint advertised via the TransportBinding env payload.
 type TransportConnectorClient struct {
 	conn   *grpc.ClientConn
-	client transportpb.TransportConnectorClient
+	client transportpb.TransportConnectorServiceClient
 }
 
 // DialTransportConnector establishes a gRPC client connection to the generic transport connector.
@@ -54,7 +53,11 @@ func dialTransportConnector(
 		return nil, fmt.Errorf("transport connector endpoint empty")
 	}
 
-	dialOpts := append(defaultTransportDialOptions(env), opts...)
+	baseDialOpts, err := defaultTransportDialOptions(endpoint, env)
+	if err != nil {
+		return nil, err
+	}
+	dialOpts := append(baseDialOpts, opts...)
 	if isUnixEndpoint(endpoint) {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(unixDialer()))
 		endpoint = strings.TrimPrefix(endpoint, "unix://")
@@ -67,7 +70,7 @@ func dialTransportConnector(
 
 	waitCtx, cancel := contextWithDialTimeout(ctx, env)
 	defer cancel()
-	if err := waitForReady(waitCtx, conn); err != nil {
+	if err := transportconnector.WaitForReady(waitCtx, conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -75,18 +78,18 @@ func dialTransportConnector(
 	if isDebugEnabled() {
 		LoggerFromContext(ctx).Debug("Connector dial complete",
 			slog.String("endpoint", endpoint),
-			slog.Bool("insecure", allowInsecureTransport(env)),
+			slog.Bool("tls", !usesPlaintextLocalConnector(endpoint)),
 		)
 	}
 
 	return &TransportConnectorClient{
 		conn:   conn,
-		client: transportpb.NewTransportConnectorClient(conn),
+		client: transportpb.NewTransportConnectorServiceClient(conn),
 	}, nil
 }
 
 // Client exposes the underlying generated gRPC client.
-func (c *TransportConnectorClient) Client() transportpb.TransportConnectorClient {
+func (c *TransportConnectorClient) Client() transportpb.TransportConnectorServiceClient {
 	if c == nil {
 		return nil
 	}
@@ -101,39 +104,41 @@ func (c *TransportConnectorClient) Close() error {
 	return c.conn.Close()
 }
 
-func defaultTransportDialOptions(env envResolver) []grpc.DialOption {
-	maxRecv := getEnvInt(DefaultMaxMessageSize, contracts.GRPCClientMaxRecvBytesEnv, env)
-	maxSend := getEnvInt(DefaultMaxMessageSize, contracts.GRPCClientMaxSendBytesEnv, env)
-	dialTimeout := resolveDialTimeout(env)
+func defaultTransportDialOptions(endpoint string, env envResolver) ([]grpc.DialOption, error) {
+	if err := validateTransportSecurityMode(env); err != nil {
+		return nil, err
+	}
+	callOpts := transportconnector.ClientCallOptions(
+		env,
+		transportconnector.DefaultMaxMessageSize,
+		transportconnector.DefaultMaxMessageSize,
+	)
+	dialTimeout := transportconnector.DialTimeout(env, defaultDialTimeout)
 	connectParams := grpc.ConnectParams{}
 	if dialTimeout > 0 {
 		connectParams.MinConnectTimeout = dialTimeout
 	}
 
-	var creds credentials.TransportCredentials
-	if allowInsecureTransport(env) {
-		creds = insecure.NewCredentials()
-	} else {
-		creds = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
-	}
+	creds := defaultTransportCredentials(endpoint)
 
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxRecv),
-			grpc.MaxCallSendMsgSize(maxSend),
-		),
 		grpc.WithConnectParams(connectParams),
+	}
+	if len(callOpts) > 0 {
+		opts = append(opts, grpc.WithDefaultCallOptions(callOpts...))
 	}
 	if observability.TracePropagationEnabled() {
 		opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	}
-	return opts
+	return opts, nil
 }
 
-func allowInsecureTransport(env envResolver) bool {
-	mode := strings.ToLower(strings.TrimSpace(env.lookup(contracts.TransportSecurityModeEnv)))
-	return mode == contracts.TransportSecurityModePlaintext
+func defaultTransportCredentials(endpoint string) credentials.TransportCredentials {
+	if usesPlaintextLocalConnector(endpoint) {
+		return insecure.NewCredentials()
+	}
+	return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS13})
 }
 
 func unixDialer() func(context.Context, string) (net.Conn, error) {
@@ -147,6 +152,30 @@ func isUnixEndpoint(endpoint string) bool {
 	return strings.HasPrefix(endpoint, "unix://")
 }
 
+func usesPlaintextLocalConnector(endpoint string) bool {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return false
+	}
+	if isUnixEndpoint(endpoint) {
+		return true
+	}
+	host := endpoint
+	if strings.Contains(endpoint, ":") {
+		parsedHost, _, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			return false
+		}
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 var connectorDial = func(
 	ctx context.Context,
 	endpoint string,
@@ -156,49 +185,22 @@ var connectorDial = func(
 	return dialTransportConnector(ctx, endpoint, env, opts...)
 }
 
-func getEnvInt(def int, name string, env envResolver) int {
-	if v := env.lookup(name); strings.TrimSpace(v) != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			return parsed
-		}
-	}
-	return def
-}
-
 func contextWithDialTimeout(ctx context.Context, env envResolver) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
-	timeout := resolveDialTimeout(env)
+	timeout := transportconnector.DialTimeout(env, defaultDialTimeout)
 	if timeout <= 0 {
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, timeout)
 }
 
-func waitForReady(ctx context.Context, conn *grpc.ClientConn) error {
-	for {
-		state := conn.GetState()
-		if state == connectivity.Ready {
-			return nil
-		}
-		conn.Connect()
-		if !conn.WaitForStateChange(ctx, state) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return fmt.Errorf("connector stuck in %s state", state)
-		}
+func validateTransportSecurityMode(env envResolver) error {
+	mode := strings.ToLower(strings.TrimSpace(env.lookup(contracts.TransportSecurityModeEnv)))
+	if mode == "" || mode == contracts.TransportSecurityModeTLS {
+		return nil
 	}
-}
-
-func resolveDialTimeout(env envResolver) time.Duration {
-	raw := strings.TrimSpace(env.lookup(contracts.GRPCDialTimeoutEnv))
-	if raw == "" {
-		return defaultDialTimeout
-	}
-	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-		return d
-	}
-	return defaultDialTimeout
+	return fmt.Errorf("invalid %s %q: only %q is supported", contracts.TransportSecurityModeEnv, mode,
+		contracts.TransportSecurityModeTLS)
 }

@@ -17,16 +17,23 @@ limitations under the License.
 package engram
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bubustack/bubu-sdk-go/pkg/observability"
+	"github.com/bubustack/tractatus/envelope"
 	"github.com/stretchr/testify/assert"
 )
+
+const testSecretValue = "value"
 
 func TestSecrets_Get(t *testing.T) {
 	tests := []struct {
@@ -99,6 +106,46 @@ func TestSecrets_GetAll(t *testing.T) {
 	}
 }
 
+func TestSecrets_NamesReturnsSortedCopy(t *testing.T) {
+	s := NewSecrets(context.Background(), map[string]string{
+		"zeta":  "3",
+		"alpha": "1",
+		"beta":  "2",
+	})
+
+	names := s.Names()
+	assert.Equal(t, []string{"alpha", "beta", "zeta"}, names)
+
+	names[0] = "mutated"
+	assert.Equal(t, []string{"alpha", "beta", "zeta"}, s.Names())
+}
+
+func TestSecrets_SelectReturnsRequestedValuesOnly(t *testing.T) {
+	s := NewSecrets(context.Background(), map[string]string{
+		"API_KEY": "secret123",
+		"TOKEN":   "token456",
+	})
+
+	selected := s.Select("TOKEN", "MISSING")
+	assert.Equal(t, map[string]string{"TOKEN": "token456"}, selected)
+
+	selected["TOKEN"] = "changed" //nolint:goconst
+	value, ok := s.Get("TOKEN")
+	assert.True(t, ok)
+	assert.Equal(t, "token456", value)
+}
+
+func TestSecrets_AccessorsHandleNilReceiver(t *testing.T) {
+	var s *Secrets
+
+	value, ok := s.Get("missing")
+	assert.False(t, ok)
+	assert.Empty(t, value)
+	assert.Empty(t, s.GetAll())
+	assert.Empty(t, s.Names())
+	assert.Empty(t, s.Select("missing"))
+}
+
 func TestNewSecrets_EnvPrefixExpansion(t *testing.T) {
 	err := os.Setenv("PAY_apiKey", "abc")
 	if err != nil {
@@ -146,10 +193,251 @@ func TestNewSecrets_FileDirExpansion(t *testing.T) {
 	}
 }
 
+func TestNewSecrets_FileDirExpansionPreservesRelativePathsForNestedFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "db", "writer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "db", "reader"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "db", "writer", "password"), []byte("writer-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "db", "reader", "password"), []byte("reader-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSecrets(context.Background(), map[string]string{"db": "file:" + dir})
+	if v, ok := s.Get("db/writer/password"); !ok || v != "writer-secret" {
+		t.Fatalf("nested file expansion failed for db/writer/password: ok=%v v=%q", ok, v)
+	}
+	if v, ok := s.Get("db/reader/password"); !ok || v != "reader-secret" {
+		t.Fatalf("nested file expansion failed for db/reader/password: ok=%v v=%q", ok, v)
+	}
+	if _, ok := s.Get("password"); ok {
+		t.Fatal("nested file expansion must not collapse duplicate basenames")
+	}
+}
+
+func TestNewSecrets_FileDirExpansionRejectsSymlinkedFiles(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "outside-token")
+	if err := os.WriteFile(target, []byte("top-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "token")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+
+	s := NewSecrets(context.Background(), map[string]string{"db": "file:" + dir})
+	if _, ok := s.Get("token"); ok {
+		t.Fatal("symlinked files must not be imported as secrets")
+	}
+}
+
+func TestNewSecrets_FileDirExpansionRejectsOversizedFiles(t *testing.T) {
+	dir := t.TempDir()
+	oversized := strings.Repeat("x", defaultSecretExpansionMaxFileBytes+1)
+	if err := os.WriteFile(filepath.Join(dir, "huge"), []byte(oversized), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSecrets(context.Background(), map[string]string{"db": "file:" + dir})
+	if _, ok := s.Get("huge"); ok {
+		t.Fatal("oversized secret files must not be imported")
+	}
+}
+
+func TestNewSecrets_FileDirExpansionRejectsTooManyFiles(t *testing.T) {
+	dir := t.TempDir()
+	for i := range defaultSecretExpansionMaxFiles + 1 {
+		name := filepath.Join(dir, fmt.Sprintf("secret-%03d", i))
+		if err := os.WriteFile(name, []byte(testSecretValue), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := NewSecrets(context.Background(), map[string]string{"db": "file:" + dir})
+	names := s.Names()
+	if len(names) != 0 {
+		t.Fatalf(
+			"expected descriptor to fail closed when file count exceeds %d, got %d imported secrets",
+			defaultSecretExpansionMaxFiles,
+			len(names),
+		)
+	}
+}
+
+func TestNewSecrets_DoesNotFallbackToRawDescriptorOnFileExpansionFailure(t *testing.T) {
+	missingDir := filepath.Join(t.TempDir(), "missing")
+	s := NewSecrets(context.Background(), map[string]string{"db": "file:" + missingDir})
+
+	if _, ok := s.Get("db"); ok {
+		t.Fatal("failed file expansion must not expose the raw descriptor as a secret value")
+	}
+}
+
+func TestNewSecrets_RedactsDescriptorInWarningLogs(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+	defer slog.SetDefault(prev)
+
+	missingDir := filepath.Join(t.TempDir(), "missing")
+	NewSecrets(context.Background(), map[string]string{
+		"db":     "file:" + missingDir,
+		"badEnv": "env:",
+	})
+
+	output := buf.String()
+	if strings.Contains(output, missingDir) {
+		t.Fatalf("warning logs must not include raw secret paths: %s", output)
+	}
+	if strings.Contains(output, "file:"+missingDir) {
+		t.Fatalf("warning logs must not include raw file descriptors: %s", output)
+	}
+	if strings.Contains(output, "\"descriptor\":") {
+		t.Fatalf("warning logs must not include a raw descriptor field: %s", output)
+	}
+	if !strings.Contains(output, "\"secret\":\"db\"") || !strings.Contains(output, "\"descriptorKind\":\"file\"") {
+		t.Fatalf("warning logs should retain the logical secret name and kind for file failures: %s", output)
+	}
+	if !strings.Contains(output, "\"secret\":\"badEnv\"") || !strings.Contains(output, "\"descriptorKind\":\"env\"") {
+		t.Fatalf("warning logs should retain the logical secret name and kind for env failures: %s", output)
+	}
+}
+
+func TestNewSecretsWithErrorReturnsPartialSecretsAndRedactedErrors(t *testing.T) {
+	missingDir := filepath.Join(t.TempDir(), "missing")
+
+	secrets, err := NewSecretsWithError(context.Background(), map[string]string{
+		"literal": testSecretValue,
+		"db":      "file:" + missingDir,
+		"badEnv":  "env:",
+	})
+	if err == nil {
+		t.Fatal("expected secret expansion error")
+	}
+	if !errors.Is(err, ErrSecretExpansionFailed) {
+		t.Fatalf("expected ErrSecretExpansionFailed, got %v", err)
+	}
+	if secrets == nil {
+		t.Fatal("expected partial secrets to be returned")
+	}
+	if v, ok := secrets.Get("literal"); !ok || v != testSecretValue {
+		t.Fatalf("expected literal secret to be preserved, ok=%v v=%q", ok, v)
+	}
+	if _, ok := secrets.Get("db"); ok {
+		t.Fatal("failed file expansion must not expose the raw descriptor")
+	}
+	if _, ok := secrets.Get("badEnv"); ok {
+		t.Fatal("failed env expansion must not expose the raw descriptor")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `secret "db" (file)`) {
+		t.Fatalf("expected file secret name in error, got: %s", msg)
+	}
+	if !strings.Contains(msg, `secret "badEnv" (env)`) {
+		t.Fatalf("expected env secret name in error, got: %s", msg)
+	}
+	if strings.Contains(msg, missingDir) {
+		t.Fatalf("error must not leak raw secret path: %s", msg)
+	}
+	if strings.Contains(msg, "file:"+missingDir) {
+		t.Fatalf("error must not leak raw file descriptor: %s", msg)
+	}
+	if strings.Contains(msg, "env:") {
+		t.Fatalf("error must not leak raw env descriptor: %s", msg)
+	}
+}
+
+func TestNewSecretsWithErrorRejectsNilContext(t *testing.T) {
+	_, err := NewSecretsWithError(nil, map[string]string{"key": testSecretValue}) //nolint:staticcheck
+	if err == nil {
+		t.Fatal("expected nil context to return an error")
+	}
+}
+
+func TestNewSecretsNilContextFailsClosed(t *testing.T) {
+	secrets := NewSecrets(nil, map[string]string{"literal": testSecretValue}) //nolint:staticcheck
+	if secrets == nil {
+		t.Fatal("expected empty secrets, got nil")
+	}
+	if _, ok := secrets.Get("literal"); ok {
+		t.Fatal("expected nil-context NewSecrets call to fail closed")
+	}
+	if got := secrets.GetAll(); len(got) != 0 {
+		t.Fatalf("expected no secrets after nil-context failure, got %v", got)
+	}
+}
+
+func TestNewSecretsWithErrorFailsClosedForUnreadableDirectoryEntries(t *testing.T) {
+	dir := t.TempDir()
+	goodPath := filepath.Join(dir, "good.txt")
+	badPath := filepath.Join(dir, "bad.txt")
+	if err := os.WriteFile(goodPath, []byte("good"), 0o600); err != nil {
+		t.Fatalf("write good secret: %v", err)
+	}
+	if err := os.WriteFile(badPath, []byte("bad"), 0o600); err != nil {
+		t.Fatalf("write unreadable secret: %v", err)
+	}
+	if err := os.Chmod(badPath, 0o000); err != nil {
+		t.Fatalf("chmod unreadable secret: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(badPath, 0o600)
+	})
+	if _, err := os.ReadFile(badPath); err == nil {
+		t.Skip("filesystem permissions still allow reading chmod 000 file")
+	}
+
+	secrets, err := NewSecretsWithError(context.Background(), map[string]string{
+		"literal": "value",
+		"dir":     "file:" + dir,
+	})
+	if err == nil {
+		t.Fatal("expected unreadable directory entry error")
+	}
+	if !errors.Is(err, ErrSecretExpansionFailed) {
+		t.Fatalf("expected ErrSecretExpansionFailed, got %v", err)
+	}
+	if secrets == nil {
+		t.Fatal("expected partial secrets for unrelated descriptors")
+	}
+	if got, ok := secrets.Get("literal"); !ok || got != "value" {
+		t.Fatalf("expected literal secret to survive, ok=%v got=%q", ok, got)
+	}
+	if _, ok := secrets.Get("good.txt"); ok {
+		t.Fatal("expected directory-backed secrets to fail closed when any entry is unreadable")
+	}
+}
+
 func TestSecrets_Format(t *testing.T) {
 	s := NewSecrets(context.Background(), map[string]string{"key": "value"})
 	output := fmt.Sprintf("%v", s)
 	assert.Equal(t, "[redacted secrets]", output)
+}
+
+func TestSecrets_LogValueRedactsStructuredLogging(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	secrets := NewSecrets(context.Background(), map[string]string{"apiKey": "secret-value"})
+
+	logger.Info("testing secrets", "secrets", secrets)
+
+	output := buf.String()
+	if strings.Contains(output, "secret-value") {
+		t.Fatalf("structured logging must not include secret values: %s", output)
+	}
+	if strings.Contains(output, "apiKey") {
+		t.Fatalf("structured logging must not include secret keys by default: %s", output)
+	}
+	if !strings.Contains(output, "[redacted secrets]") {
+		t.Fatalf("structured logging should emit the redacted sentinel, got: %s", output)
+	}
 }
 
 func TestNewSecrets_NilInput(t *testing.T) {
@@ -176,6 +464,51 @@ func TestNewSecrets_ContextCancellationStopsExpansion(t *testing.T) {
 	s := NewSecrets(ctx, map[string]string{"literal": "value"})
 	if _, ok := s.Get("literal"); ok {
 		t.Fatalf("expected literal secrets to be skipped when context is canceled")
+	}
+}
+
+func TestNewSecrets_EmptyEnvPrefixDoesNotExpandWholeEnvironment(t *testing.T) {
+	if err := os.Setenv("BUBU_TEST_SECRET_ONE", "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("BUBU_TEST_SECRET_TWO", "two"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Unsetenv("BUBU_TEST_SECRET_ONE")
+		_ = os.Unsetenv("BUBU_TEST_SECRET_TWO")
+	}()
+
+	s := NewSecrets(context.Background(), map[string]string{
+		"literal": "value",
+		"bad":     "env:",
+	})
+
+	if v, ok := s.Get("literal"); !ok || v != "value" {
+		t.Fatalf("literal secret should remain available, ok=%v v=%q", ok, v)
+	}
+	if _, ok := s.Get("BUBU_TEST_SECRET_ONE"); ok {
+		t.Fatal("empty env prefix must not import the full process environment")
+	}
+	if _, ok := s.Get("BUBU_TEST_SECRET_TWO"); ok {
+		t.Fatal("empty env prefix must not import the full process environment")
+	}
+}
+
+func TestNewSecrets_LiteralSecretsOverrideExpandedCollisions(t *testing.T) {
+	if err := os.Setenv("PAY_token", "expanded-token"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Unsetenv("PAY_token")
+	}()
+
+	s := NewSecrets(context.Background(), map[string]string{
+		"payments": "env:PAY_",
+		"token":    "literal-token",
+	})
+	if v, ok := s.Get("token"); !ok || v != "literal-token" {
+		t.Fatalf("literal secret should override expansion collisions, ok=%v v=%q", ok, v)
 	}
 }
 
@@ -215,6 +548,475 @@ func TestNewExecutionContext(t *testing.T) {
 	}
 	if gotInfo.StepRunID != storyInfo.StepRunID {
 		t.Errorf("StoryInfo().StepRunID = %v, want %v", gotInfo.StepRunID, storyInfo.StepRunID)
+	}
+}
+
+func TestNewExecutionContextWithCELContextClonesInput(t *testing.T) {
+	celContext := map[string]any{
+		"inputs": map[string]any{
+			"message": "original",
+		},
+		"steps": []any{
+			map[string]any{"name": "first"},
+		},
+	}
+
+	ec := NewExecutionContextWithCELContext(nil, nil, StoryInfo{}, celContext)
+
+	inputs := celContext["inputs"].(map[string]any)
+	inputs["message"] = "mutated"
+	steps := celContext["steps"].([]any)
+	steps[0].(map[string]any)["name"] = "changed"
+
+	got := ec.CELContext()
+	if got["inputs"].(map[string]any)["message"] != "original" {
+		t.Fatalf("constructor must isolate CEL context from caller mutation, got %v", got["inputs"])
+	}
+	if got["steps"].([]any)[0].(map[string]any)["name"] != "first" {
+		t.Fatalf("constructor must deep copy nested CEL context values, got %v", got["steps"])
+	}
+}
+
+func TestExecutionContextCELContextReturnsDefensiveCopy(t *testing.T) {
+	ec := NewExecutionContextWithCELContext(nil, nil, StoryInfo{}, map[string]any{
+		"inputs": map[string]any{
+			"message": "original",
+		},
+		"steps": []any{
+			map[string]any{"name": "first"},
+		},
+	})
+
+	first := ec.CELContext()
+	first["inputs"].(map[string]any)["message"] = "mutated"
+	first["steps"].([]any)[0].(map[string]any)["name"] = "changed"
+
+	second := ec.CELContext()
+	if second["inputs"].(map[string]any)["message"] != "original" {
+		t.Fatalf("CELContext must return a defensive copy, got %v", second["inputs"])
+	}
+	if second["steps"].([]any)[0].(map[string]any)["name"] != "first" {
+		t.Fatalf("CELContext must deep copy nested values, got %v", second["steps"])
+	}
+}
+
+func TestStreamMessageValidateRejectsMultipleFrameTypes(t *testing.T) {
+	msg := StreamMessage{
+		Audio: &AudioFrame{PCM: []byte{0x01}},
+		Video: &VideoFrame{Payload: []byte{0x02}, Codec: "vp8"},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "audio, video") {
+		t.Fatalf("expected frame names in validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsBinaryPayloadMismatch(t *testing.T) {
+	msg := StreamMessage{
+		Payload: []byte(`{"ok":true}`),
+		Binary: &BinaryFrame{
+			Payload:  []byte("raw"),
+			MimeType: "application/octet-stream",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "payload and binary payload must match") {
+		t.Fatalf("expected binary mismatch validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateAllowsBinaryPayloadMirror(t *testing.T) {
+	msg := StreamMessage{
+		Payload: []byte("raw"),
+		Binary: &BinaryFrame{
+			Payload:  []byte("raw"),
+			MimeType: "application/octet-stream",
+		},
+	}
+
+	if err := msg.Validate(); err != nil {
+		t.Fatalf("expected payload-backed binary mirror to remain valid, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsKindWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		Kind:    " telemetry ",
+		Payload: []byte(`{"ok":true}`),
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "must not have surrounding whitespace") {
+		t.Fatalf("expected kind whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsMessageIDWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		MessageID: " msg-1 ",
+		Payload:   []byte(`{"ok":true}`),
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "message_id must not have surrounding whitespace") {
+		t.Fatalf("expected message_id whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsEmptyMetadataKey(t *testing.T) {
+	msg := StreamMessage{
+		Payload:  []byte(`{"ok":true}`),
+		Metadata: map[string]string{"": "value"},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "metadata keys must not be empty") {
+		t.Fatalf("expected empty metadata key validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsMetadataKeyWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		Payload:  []byte(`{"ok":true}`),
+		Metadata: map[string]string{" trace-id ": "abc"},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "metadata key") || !strings.Contains(err.Error(), "surrounding whitespace") {
+		t.Fatalf("expected metadata key whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsErrorKindWithoutPayload(t *testing.T) {
+	msg := StreamMessage{Kind: StreamMessageKindError}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "error messages require payload") {
+		t.Fatalf("expected error-kind payload validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsHeartbeatWithPayload(t *testing.T) {
+	msg := StreamMessage{
+		Kind:    StreamMessageKindHeartbeat,
+		Payload: []byte(`{"ok":true}`),
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "heartbeat messages must not carry payload, metadata, or frames") {
+		t.Fatalf("expected heartbeat validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsAudioWithoutPCM(t *testing.T) {
+	msg := StreamMessage{
+		Audio: &AudioFrame{
+			SampleRateHz: 16000,
+			Channels:     1,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "audio frame missing pcm payload") {
+		t.Fatalf("expected audio payload validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsAudioCodecWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		Audio: &AudioFrame{
+			PCM:          []byte{0x01},
+			SampleRateHz: 16000,
+			Channels:     1,
+			Codec:        " pcm16 ",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "audio frame codec must not have surrounding whitespace") {
+		t.Fatalf("expected audio codec whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsAudioWithoutSampleRateOrChannels(t *testing.T) {
+	msg := StreamMessage{
+		Audio: &AudioFrame{
+			PCM:          []byte{0x01},
+			SampleRateHz: 0,
+			Channels:     0,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "sample rate must be positive") {
+		t.Fatalf("expected audio sample-rate validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsRawVideoWithoutDimensions(t *testing.T) {
+	msg := StreamMessage{
+		Video: &VideoFrame{
+			Payload: []byte{0x02},
+			Raw:     true,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "raw video frame requires width and height") {
+		t.Fatalf("expected raw video dimension validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateAllowsEncodedVideoWithoutDimensions(t *testing.T) {
+	msg := StreamMessage{
+		Video: &VideoFrame{
+			Payload: []byte{0x02},
+			Codec:   "vp8",
+		},
+	}
+
+	if err := msg.Validate(); err != nil {
+		t.Fatalf("expected encoded video without explicit dimensions to remain valid, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsEncodedVideoWithoutCodec(t *testing.T) {
+	msg := StreamMessage{
+		Video: &VideoFrame{
+			Payload: []byte{0x02},
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "encoded video frame requires codec") {
+		t.Fatalf("expected encoded video codec validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsVideoCodecWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		Video: &VideoFrame{
+			Payload: []byte{0x02},
+			Codec:   " vp8 ",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "video frame codec must not have surrounding whitespace") {
+		t.Fatalf("expected video codec whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsNegativeBinaryTimestamp(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			Payload:   []byte{0x01},
+			MimeType:  "application/octet-stream",
+			Timestamp: -1 * time.Millisecond,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "binary frame timestamp must not be negative") {
+		t.Fatalf("expected negative binary timestamp validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsBinaryWithoutPayload(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			MimeType: "application/octet-stream",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "binary frame missing payload") {
+		t.Fatalf("expected missing binary payload validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsBinaryMimeTypeWithSurroundingWhitespace(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			Payload:  []byte{0x01},
+			MimeType: " application/octet-stream ",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "binary frame mime type must not have surrounding whitespace") {
+		t.Fatalf("expected binary MIME whitespace validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsInvalidBinaryMimeType(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			Payload:  []byte{0x01},
+			MimeType: "not a mime type",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "mime type") || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("expected invalid MIME validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsReservedEnvelopeMimeWithoutEnvelopeFields(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			Payload:  []byte("raw"),
+			MimeType: envelope.MIMEType,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "reserved for envelope payloads") {
+		t.Fatalf("expected reserved envelope MIME validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsReservedEnvelopeMimePayloadMismatch(t *testing.T) {
+	msg := StreamMessage{
+		Kind: "telemetry",
+		Binary: &BinaryFrame{
+			Payload:  []byte("raw"),
+			MimeType: envelope.MIMEType,
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "mirror the structured payload") {
+		t.Fatalf("expected reserved envelope mirror validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsReservedEnvelopeMimeWithParametersWithoutEnvelopeFields(t *testing.T) {
+	msg := StreamMessage{
+		Binary: &BinaryFrame{
+			Payload:  []byte(`{"ok":true}`),
+			MimeType: envelope.MIMEType + "; charset=utf-8",
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "reserved for envelope payloads") {
+		t.Fatalf("expected reserved envelope MIME validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateRejectsReservedEnvelopeMimeCaseInsensitivePayloadMismatch(t *testing.T) {
+	msg := StreamMessage{
+		Kind:    "telemetry",
+		Payload: []byte(`{"ok":true}`),
+		Binary: &BinaryFrame{
+			Payload:  []byte(`{"ok":false}`),
+			MimeType: strings.ToUpper(envelope.MIMEType),
+		},
+	}
+
+	err := msg.Validate()
+	if !errors.Is(err, ErrInvalidStreamMessage) {
+		t.Fatalf("expected ErrInvalidStreamMessage, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "mirror the structured payload") {
+		t.Fatalf("expected reserved envelope mirror validation error, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateAllowsReservedEnvelopeMimeWithParametersPayloadMirror(t *testing.T) {
+	msg := StreamMessage{
+		Kind:    "telemetry",
+		Payload: []byte(`{"ok":true}`),
+		Binary: &BinaryFrame{
+			Payload:  []byte(`{"ok":true}`),
+			MimeType: envelope.MIMEType + "; charset=utf-8",
+		},
+	}
+
+	if err := msg.Validate(); err != nil {
+		t.Fatalf("expected mirrored reserved envelope payload with parameters to remain valid, got %v", err)
+	}
+}
+
+func TestStreamMessageValidateAllowsReservedEnvelopeMimePayloadMirror(t *testing.T) {
+	msg := StreamMessage{
+		Kind:    "telemetry",
+		Payload: []byte(`{"ok":true}`),
+		Binary: &BinaryFrame{
+			Payload:  []byte(`{"ok":true}`),
+			MimeType: envelope.MIMEType,
+		},
+	}
+
+	if err := msg.Validate(); err != nil {
+		t.Fatalf("expected mirrored reserved envelope payload to remain valid, got %v", err)
 	}
 }
 
@@ -273,7 +1075,7 @@ func (t *testStreamingEngram) Init(ctx context.Context, config string, secrets *
 	return nil
 }
 
-func (t *testStreamingEngram) Stream(ctx context.Context, in <-chan StreamMessage, out chan<- StreamMessage) error {
+func (t *testStreamingEngram) Stream(ctx context.Context, in <-chan InboundMessage, out chan<- StreamMessage) error {
 	return nil
 }
 

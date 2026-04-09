@@ -33,3 +33,7 @@ func (r envResolver) lookup(key string) string {
 	}
 	return os.Getenv(key)
 }
+
+func (r envResolver) Lookup(key string) string {
+	return r.lookup(key)
+}

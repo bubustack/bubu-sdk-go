@@ -28,8 +28,10 @@ import (
 	"time"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bubu-sdk-go/k8s"
+	sdkerrors "github.com/bubustack/bubu-sdk-go/pkg/errors"
+	"github.com/bubustack/core/contracts"
+	identity "github.com/bubustack/core/runtime/identity"
 )
 
 type storyRuntime struct {
@@ -63,27 +65,55 @@ func WithStoryRuntime(
 
 // StorySession holds metadata about an active StoryRun started by an impulse.
 type StorySession struct {
-	Key       string
-	StoryRun  string
+	// Key is the dispatcher-local session key used to look up or stop the StoryRun later.
+	Key string
+	// StoryRun is the created StoryRun resource name.
+	StoryRun string
+	// Namespace is the namespace that owns StoryRun.
 	Namespace string
+	// StoryName is the logical Story that produced StoryRun.
 	StoryName string
+	// StartedAt records when the dispatcher observed the StoryRun as started.
 	StartedAt time.Time
-	Metadata  map[string]string
+	// Metadata carries optional impulse-owned attributes associated with the session.
+	Metadata map[string]string
+}
+
+func copyStorySession(s *StorySession) *StorySession {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	if len(s.Metadata) > 0 {
+		cp.Metadata = make(map[string]string, len(s.Metadata))
+		maps.Copy(cp.Metadata, s.Metadata)
+	}
+	return &cp
 }
 
 // StoryTriggerRequest defines the inputs required to trigger a story.
 type StoryTriggerRequest struct {
-	Key            string
-	StoryName      string
+	// Key optionally reserves a dispatcher session slot for later Stop/Forget calls.
+	Key string
+	// TriggerToken enables idempotent StoryRun creation when the caller provides one.
+	TriggerToken string
+	// StoryName overrides the target story name; when empty the dispatcher resolves it from the Impulse environment.
+	StoryName string
+	//nolint:lll,lll
+	// StoryNamespace overrides the target story namespace; when empty the dispatcher resolves it from the Impulse environment.
 	StoryNamespace string
-	Inputs         map[string]any
-	Metadata       map[string]string
+	// Inputs contains the structured trigger payload forwarded to the new StoryRun.
+	Inputs map[string]any
+	// Metadata carries caller-defined session metadata stored only in the local dispatcher session.
+	Metadata map[string]string
 }
 
 // StoryTriggerResult returns the StoryRun created by the dispatcher and the associated session.
 type StoryTriggerResult struct {
+	// StoryRun is the created Kubernetes StoryRun object returned by the runtime.
 	StoryRun *runsv1alpha1.StoryRun
-	Session  *StorySession
+	// Session is the dispatcher-tracked session metadata when a session key was requested.
+	Session *StorySession
 }
 
 // StoryDispatcher manages StoryRun lifecycles on behalf of an impulse, providing
@@ -125,12 +155,31 @@ func NewStoryDispatcher(opts ...StoryDispatcherOption) *StoryDispatcher {
 }
 
 // Trigger starts a StoryRun and optionally records a session keyed by req.Key.
+//
+// If req.StoryName is empty, the target story is resolved from the Impulse's spec.storyRef
+// via GetTargetStory(). This allows impulses to omit the story name in their trigger
+// requests, relying on the operator-injected environment variables instead.
 func (d *StoryDispatcher) Trigger(ctx context.Context, req StoryTriggerRequest) (*StoryTriggerResult, error) {
-	storyName := strings.TrimSpace(req.StoryName)
+	if token := strings.TrimSpace(req.TriggerToken); token != "" {
+		ctx = WithTriggerToken(ctx, token)
+	}
+	storyName := req.StoryName
+	storyNamespace := req.StoryNamespace
+
+	// If no story name is provided, resolve from environment (Impulse.spec.storyRef)
 	if storyName == "" {
-		return nil, fmt.Errorf("story name is required")
+		target, err := GetTargetStory()
+		if err != nil {
+			return nil, fmt.Errorf("story name is required: %w", err)
+		}
+		storyName = target.Name
+		// Only use target namespace if not explicitly provided
+		if storyNamespace == "" {
+			storyNamespace = target.Namespace
+		}
 	}
 	req.StoryName = storyName
+	req.StoryNamespace = storyNamespace
 
 	if req.Inputs == nil {
 		req.Inputs = make(map[string]any)
@@ -148,8 +197,7 @@ func (d *StoryDispatcher) Trigger(ctx context.Context, req StoryTriggerRequest) 
 		reserved = true
 	}
 
-	storyNamespace := strings.TrimSpace(req.StoryNamespace)
-	storyRun, err := d.runtime.start(ctx, req.StoryName, storyNamespace, req.Inputs)
+	storyRun, err := d.runtime.start(ctx, req.StoryName, req.StoryNamespace, req.Inputs)
 	d.recordTriggerStats(ctx, err)
 	if err != nil {
 		if reserved {
@@ -170,14 +218,21 @@ func (d *StoryDispatcher) Trigger(ctx context.Context, req StoryTriggerRequest) 
 		StoryName: req.StoryName,
 		StartedAt: d.timeSource().UTC(),
 	}
+	metadata := identity.StoryRunSelectorLabels(storyRun.Name)
 	if len(req.Metadata) > 0 {
-		session.Metadata = maps.Clone(req.Metadata)
+		if metadata == nil {
+			metadata = make(map[string]string, len(req.Metadata))
+		}
+		maps.Copy(metadata, req.Metadata)
+	}
+	if len(metadata) > 0 {
+		session.Metadata = metadata
 	}
 
 	d.mu.Lock()
 	d.sessions[sessionKey] = session
 	d.mu.Unlock()
-	result.Session = session
+	result.Session = copyStorySession(session)
 	return result, nil
 }
 
@@ -245,7 +300,7 @@ func (d *StoryDispatcher) initImpulseMetricsClient() {
 		return
 	}
 	namespace := strings.TrimSpace(os.Getenv(contracts.ImpulseNamespaceEnv))
-	client, err := k8s.NewClient()
+	client, err := k8s.SharedClient()
 	if err != nil {
 		log.Printf("bubu sdk: unable to initialize impulse metrics client: %v", err)
 		return
@@ -263,12 +318,17 @@ func (d *StoryDispatcher) recordTriggerStats(ctx context.Context, triggerErr err
 		TriggersReceived: 1,
 		LastTrigger:      d.timeSource().UTC(),
 	}
-	if triggerErr != nil {
-		delta.FailedTriggers = 1
-	} else {
+	switch {
+	case triggerErr == nil:
 		delta.StoriesLaunched = 1
 		successTime := delta.LastTrigger
 		delta.LastSuccess = &successTime
+	case errors.Is(triggerErr, sdkerrors.ErrRetryable),
+		errors.Is(triggerErr, context.Canceled),
+		errors.Is(triggerErr, context.DeadlineExceeded):
+		// do not classify retryable/pending as durable failures
+	default:
+		delta.FailedTriggers = 1
 	}
 	if err := d.statsClient.UpdateImpulseTriggerStats(ctx, d.impulseName, d.impulseNamespace, delta); err != nil {
 		log.Printf("bubu sdk: failed to update impulse trigger stats: %v", err)

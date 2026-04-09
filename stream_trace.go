@@ -5,7 +5,6 @@ import (
 
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/bubu-sdk-go/pkg/observability"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 )
 
@@ -17,7 +16,7 @@ func injectTraceContext(ctx context.Context, msg *engram.StreamMessage) {
 	if metadata == nil {
 		metadata = make(map[string]string, 2)
 	}
-	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(metadata))
+	observability.Propagator().Inject(ctx, propagation.MapCarrier(metadata))
 	msg.Metadata = metadata
 }
 
@@ -27,5 +26,5 @@ func ExtractTraceContext(ctx context.Context, msg *engram.StreamMessage) context
 	if msg == nil || len(msg.Metadata) == 0 || !observability.TracePropagationEnabled() {
 		return ctx
 	}
-	return otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(msg.Metadata))
+	return observability.Propagator().Extract(ctx, propagation.MapCarrier(msg.Metadata))
 }

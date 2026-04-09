@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bubu-sdk-go/engram"
+	"github.com/bubustack/core/contracts"
 	"go.opentelemetry.io/otel/trace"
 )
 

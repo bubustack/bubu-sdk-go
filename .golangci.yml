@@ -21,9 +21,18 @@ linters:
     - unconvert
     - unparam
     - unused
+    - modernize
+    - logcheck
   settings:
     gocyclo:
       min-complexity: 15
+    modernize:
+      disable:
+        - omitzero
+    custom:
+      logcheck:
+        type: "module"
+        description: Checks Go logging calls for Kubernetes logging conventions.
     revive:
       rules:
         - name: comment-spacings

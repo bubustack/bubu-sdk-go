@@ -17,11 +17,13 @@ limitations under the License.
 package observability
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
+	"github.com/bubustack/core/runtime/featuretoggles"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -33,14 +35,44 @@ var (
 	metricsEnabled          bool
 	tracingEnabled          bool
 	tracePropagationEnabled bool
+	prop                    propagation.TextMapPropagator
 	noopTracerProvider      = noop.NewTracerProvider()
 )
 
+func resetConfigForTesting() {
+	initOnce = sync.Once{}
+	metricsEnabled = false
+	tracingEnabled = false
+	tracePropagationEnabled = false
+	prop = nil
+}
+
 func initConfig() {
-	metricsEnabled = parseBoolEnv(contracts.SDKMetricsEnabledEnv, true)
-	tracingEnabled = parseBoolEnv(contracts.SDKTracingEnabledEnv, true)
-	tracePropagationEnabled = parseBoolEnv(contracts.TracePropagationEnv, true)
-	configurePropagator()
+	toggles := featuretoggles.Features{
+		MetricsEnabled:          parseBoolEnv(contracts.SDKMetricsEnabledEnv, true),
+		TelemetryEnabled:        parseBoolEnv(contracts.SDKTracingEnabledEnv, true),
+		TracePropagationEnabled: parseBoolEnv(contracts.TracePropagationEnv, true),
+	}
+
+	featuretoggles.Apply(toggles, featuretoggles.Sink{
+		EnableTelemetry: func(enabled bool) {
+			tracingEnabled = enabled
+		},
+		EnableTracePropagation: func(enabled bool) {
+			tracePropagationEnabled = enabled
+			if enabled {
+				prop = propagation.NewCompositeTextMapPropagator(
+					propagation.TraceContext{},
+					propagation.Baggage{},
+				)
+			} else {
+				prop = propagation.NewCompositeTextMapPropagator()
+			}
+		},
+		EnableMetrics: func(enabled bool) {
+			metricsEnabled = enabled
+		},
+	})
 }
 
 // MetricsEnabled reports whether SDK metrics emission is enabled. Defaults to true.
@@ -61,23 +93,21 @@ func TracePropagationEnabled() bool {
 	return tracePropagationEnabled
 }
 
+// Propagator returns the configured propagator without mutating the process-global OTEL state.
+func Propagator() propagation.TextMapPropagator {
+	initOnce.Do(initConfig)
+	if prop != nil {
+		return prop
+	}
+	return otel.GetTextMapPropagator()
+}
+
 // Tracer returns a trace.Tracer that honors the tracing toggle.
 func Tracer(name string) trace.Tracer {
 	if !TracingEnabled() {
 		return noopTracerProvider.Tracer(name)
 	}
 	return otel.Tracer(name)
-}
-
-func configurePropagator() {
-	if tracePropagationEnabled {
-		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-			propagation.TraceContext{},
-			propagation.Baggage{},
-		))
-		return
-	}
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
 }
 
 func parseBoolEnv(key string, def bool) bool {
@@ -91,6 +121,7 @@ func parseBoolEnv(key string, def bool) bool {
 	case "0", "false", "f", "no", "n", "off":
 		return false
 	default:
+		slog.Default().Warn("ignoring invalid observability env override", "env", key, "value", val, "default", def)
 		return def
 	}
 }
