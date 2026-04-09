@@ -159,20 +159,31 @@ func runWithClientsWithContext[C any, I any](
 
 	// Prepare typed inputs (hydrate + unmarshal with failure patching)
 	inputs, err := hydrateAndUnmarshalInputs[C, I](ctxWithTimeout, sm, k8sClient, execCtxData)
-	if err != nil {
+
+	var (
+		result            *engram.Result
+		processErr        error
+		terminateOverride *statusOverride
+	)
+
+	switch {
+	case err != nil && ctxWithTimeout.Err() == context.DeadlineExceeded:
+		// Timeout during input preparation — fall through to shared timeout handling.
+		processErr = err
+	case err != nil:
+		// Non-timeout failure — already patched inside hydrateAndUnmarshalInputs.
 		return err
+	default:
+		logTypedInputs(logger, inputs)
+
+		// Process the inputs.
+		result, processErr = callWithPanicRecovery[*engram.Result]("engram Process", func() (*engram.Result, error) {
+			return e.Process(ctxWithTimeout, execCtx, inputs)
+		})
+		logProcessResult(logger, result, processErr)
 	}
-	logTypedInputs(logger, inputs)
 
-	var terminateOverride *statusOverride
-
-	// Process the inputs.
-	result, processErr := callWithPanicRecovery[*engram.Result]("engram Process", func() (*engram.Result, error) {
-		return e.Process(ctxWithTimeout, execCtx, inputs)
-	})
-	logProcessResult(logger, result, processErr)
-
-	// Check if timeout was hit
+	// Check if timeout was hit (during input preparation or processing)
 	timedOut := ctxWithTimeout.Err() == context.DeadlineExceeded
 	var timeoutErr *BatchTimeoutError
 	if timedOut {
@@ -811,6 +822,8 @@ func combinePatchError(finalErr error, patchErr error) error {
 }
 
 // patchFailureStatus builds and sends a failure status patch with consistent fields.
+// If the context is already done (e.g. deadline exceeded) the patch is skipped and nil
+// is returned so the caller can handle timeout/cancellation semantics instead.
 func patchFailureStatus(
 	ctx context.Context,
 	k8sClient K8sClient,
@@ -818,6 +831,9 @@ func patchFailureStatus(
 	err error,
 	exitCode int,
 ) error {
+	if ctx.Err() != nil {
+		return nil
+	}
 	finishedAt := metav1.Now()
 	exitClass := enums.ExitClassTerminal
 	if override, ok := overrideExitClassFromError(err); ok {
