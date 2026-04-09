@@ -33,6 +33,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+const testMutatedValue = "mutated"
+
 const testSecretValue = "value"
 
 func TestSecrets_Get(t *testing.T) {
@@ -116,7 +118,7 @@ func TestSecrets_NamesReturnsSortedCopy(t *testing.T) {
 	names := s.Names()
 	assert.Equal(t, []string{"alpha", "beta", "zeta"}, names)
 
-	names[0] = "mutated"
+	names[0] = testMutatedValue
 	assert.Equal(t, []string{"alpha", "beta", "zeta"}, s.Names())
 }
 
@@ -564,7 +566,7 @@ func TestNewExecutionContextWithCELContextClonesInput(t *testing.T) {
 	ec := NewExecutionContextWithCELContext(nil, nil, StoryInfo{}, celContext)
 
 	inputs := celContext["inputs"].(map[string]any)
-	inputs["message"] = "mutated"
+	inputs["message"] = testMutatedValue
 	steps := celContext["steps"].([]any)
 	steps[0].(map[string]any)["name"] = "changed"
 
@@ -588,7 +590,7 @@ func TestExecutionContextCELContextReturnsDefensiveCopy(t *testing.T) {
 	})
 
 	first := ec.CELContext()
-	first["inputs"].(map[string]any)["message"] = "mutated"
+	first["inputs"].(map[string]any)["message"] = testMutatedValue
 	first["steps"].([]any)[0].(map[string]any)["name"] = "changed"
 
 	second := ec.CELContext()

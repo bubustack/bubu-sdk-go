@@ -7,7 +7,10 @@ import (
 	"strings"
 )
 
-const dns1123MaxLength = 63
+const (
+	dns1123MaxLength    = 63
+	defaultResourceName = "resource"
+)
 
 // ComposeDNS1123Name builds a DNS-1123 compliant name from provided parts.
 // It preserves readability when possible and appends a hash suffix when needed.
@@ -21,7 +24,7 @@ func ComposeDNS1123Name(parts ...string) string {
 	}
 	base := strings.Join(baseParts, "-")
 	if base == "" {
-		base = "resource"
+		base = defaultResourceName
 	}
 	if len(base) <= dns1123MaxLength {
 		return base
@@ -39,7 +42,7 @@ func ComposeDNS1123Name(parts ...string) string {
 
 	prefix := strings.TrimSuffix(base[:prefixLen], "-")
 	if prefix == "" {
-		prefix = "resource"
+		prefix = defaultResourceName
 	}
 	name := fmt.Sprintf("%s-%s", prefix, suffix)
 	if len(name) > dns1123MaxLength {
