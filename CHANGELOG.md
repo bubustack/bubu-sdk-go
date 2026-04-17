@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/bubustack/bubu-sdk-go/compare/v0.1.2...v0.1.3) (2026-04-17)
+
+
+### Miscellaneous
+
+* update dependencies ([e7944d7](https://github.com/bubustack/bubu-sdk-go/commit/e7944d799240f9a5b0b455052f9933a65c722327))
+
 ## [0.1.2](https://github.com/bubustack/bubu-sdk-go/compare/v0.1.2...v0.1.2) (2026-04-09)
 
 
