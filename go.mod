@@ -3,7 +3,7 @@ module github.com/bubustack/bubu-sdk-go
 go 1.26.2
 
 require (
-	github.com/bubustack/bobrapet v0.1.9
+	github.com/bubustack/bobrapet v0.1.12
 	github.com/bubustack/core v0.1.5
 	github.com/bubustack/tractatus v0.1.4
 	github.com/google/uuid v1.6.0
