@@ -159,17 +159,14 @@ func TestStreamMessageToPublishRequestEnvelope(t *testing.T) {
 }
 
 func TestStreamMessageEnvelopeClonesTypedTransportConfig(t *testing.T) {
-	type nestedMap map[string]string
-	type nestedSlice []map[string]int
-
 	msg := engram.StreamMessage{
 		Transports: []engram.TransportDescriptor{
 			{
 				Name: "primary",
 				Kind: "livekit",
-				Config: map[string]any{
-					"labels": nestedMap{"room": "alpha"},
-					"routes": nestedSlice{{"priority": 1}},
+				TypedConfig: &engram.TransportConfig{
+					TransportRef: "livekit-default",
+					ModeReason:   "streaming-default",
 				},
 			},
 		},
@@ -179,16 +176,63 @@ func TestStreamMessageEnvelopeClonesTypedTransportConfig(t *testing.T) {
 	require.NotNil(t, env)
 	require.Len(t, env.Transports, 1)
 
-	msg.Transports[0].Config["labels"].(nestedMap)["room"] = "beta"
-	msg.Transports[0].Config["routes"].(nestedSlice)[0]["priority"] = 2
+	msg.Transports[0].TypedConfig.TransportRef = "changed-ref"
+	msg.Transports[0].TypedConfig.ModeReason = "changed-reason"
 
-	labels, ok := env.Transports[0].Config["labels"].(nestedMap)
-	require.True(t, ok)
-	require.Equal(t, "alpha", labels["room"])
+	require.NotNil(t, env.Transports[0].TypedConfig)
+	require.Equal(t, "livekit-default", env.Transports[0].TypedConfig.TransportRef)
+	require.Equal(t, "streaming-default", env.Transports[0].TypedConfig.ModeReason)
+}
 
-	routes, ok := env.Transports[0].Config["routes"].(nestedSlice)
-	require.True(t, ok)
-	require.Equal(t, 1, routes[0]["priority"])
+func TestStreamMessageEnvelopePreservesTypedTransportConfig(t *testing.T) {
+	msg := engram.StreamMessage{
+		Transports: []engram.TransportDescriptor{{
+			Name: "primary",
+			Kind: "livekit",
+			Mode: "hot",
+			TypedConfig: &engram.TransportConfig{
+				TransportRef: "livekit-default",
+				ModeReason:   "streaming-default",
+			},
+		}},
+	}
+
+	env := streamMessageEnvelope(msg)
+	require.NotNil(t, env)
+	require.Len(t, env.Transports, 1)
+	require.NotNil(t, env.Transports[0].TypedConfig)
+	require.Equal(t, "livekit-default", env.Transports[0].TypedConfig.TransportRef)
+	require.Equal(t, "streaming-default", env.Transports[0].TypedConfig.ModeReason)
+}
+
+func TestTransportProtoConversionPreservesTypedConfig(t *testing.T) {
+	protoDescriptors := transportsToProto([]engram.TransportDescriptor{{
+		Name: "primary",
+		Kind: "livekit",
+		Mode: "hot",
+		TypedConfig: &engram.TransportConfig{
+			TransportRef: "livekit-default",
+			ModeReason:   "streaming-default",
+		},
+	}})
+	require.Len(t, protoDescriptors, 1)
+	require.NotNil(t, protoDescriptors[0].GetTypedConfig())
+	require.Equal(t, "livekit-default", protoDescriptors[0].GetTypedConfig().GetTransportRef())
+	require.Equal(t, "streaming-default", protoDescriptors[0].GetTypedConfig().GetModeReason())
+
+	sdkDescriptors := transportsFromProto([]*transportpb.TransportDescriptor{{
+		Name: "secondary",
+		Kind: "grpc",
+		Mode: "fallback",
+		TypedConfig: &transportpb.TransportConfig{
+			TransportRef: "storage-default",
+			ModeReason:   "spillover",
+		},
+	}})
+	require.Len(t, sdkDescriptors, 1)
+	require.NotNil(t, sdkDescriptors[0].TypedConfig)
+	require.Equal(t, "storage-default", sdkDescriptors[0].TypedConfig.TransportRef)
+	require.Equal(t, "spillover", sdkDescriptors[0].TypedConfig.ModeReason)
 }
 
 func TestStreamMessageToPublishRequestBinaryFrame(t *testing.T) {
@@ -429,17 +473,14 @@ func TestPublishRequestToStreamMessageBinary(t *testing.T) {
 }
 
 func TestPopulateMessageFromEnvelopeClonesTypedTransportConfig(t *testing.T) {
-	type nestedMap map[string]string
-	type nestedSlice []map[string]int
-
 	env := &envelope.Envelope{
 		Transports: []envelope.TransportDescriptor{
 			{
 				Name: "primary",
 				Kind: "livekit",
-				Config: map[string]any{
-					"labels": nestedMap{"room": "alpha"},
-					"routes": nestedSlice{{"priority": 1}},
+				TypedConfig: &envelope.TransportConfig{
+					TransportRef: "livekit-default",
+					ModeReason:   "streaming-default",
 				},
 			},
 		},
@@ -449,16 +490,33 @@ func TestPopulateMessageFromEnvelopeClonesTypedTransportConfig(t *testing.T) {
 	populateMessageFromEnvelope(&msg, env)
 	require.Len(t, msg.Transports, 1)
 
-	env.Transports[0].Config["labels"].(nestedMap)["room"] = "beta"
-	env.Transports[0].Config["routes"].(nestedSlice)[0]["priority"] = 2
+	env.Transports[0].TypedConfig.TransportRef = "changed-ref"
+	env.Transports[0].TypedConfig.ModeReason = "changed-reason"
 
-	labels, ok := msg.Transports[0].Config["labels"].(nestedMap)
-	require.True(t, ok)
-	require.Equal(t, "alpha", labels["room"])
+	require.NotNil(t, msg.Transports[0].TypedConfig)
+	require.Equal(t, "livekit-default", msg.Transports[0].TypedConfig.TransportRef)
+	require.Equal(t, "streaming-default", msg.Transports[0].TypedConfig.ModeReason)
+}
 
-	routes, ok := msg.Transports[0].Config["routes"].(nestedSlice)
-	require.True(t, ok)
-	require.Equal(t, 1, routes[0]["priority"])
+func TestPopulateMessageFromEnvelopePreservesTypedTransportConfig(t *testing.T) {
+	env := &envelope.Envelope{
+		Transports: []envelope.TransportDescriptor{{
+			Name: "primary",
+			Kind: "livekit",
+			Mode: "hot",
+			TypedConfig: &envelope.TransportConfig{
+				TransportRef: "livekit-default",
+				ModeReason:   "streaming-default",
+			},
+		}},
+	}
+
+	var msg engram.StreamMessage
+	populateMessageFromEnvelope(&msg, env)
+	require.Len(t, msg.Transports, 1)
+	require.NotNil(t, msg.Transports[0].TypedConfig)
+	require.Equal(t, "livekit-default", msg.Transports[0].TypedConfig.TransportRef)
+	require.Equal(t, "streaming-default", msg.Transports[0].TypedConfig.ModeReason)
 }
 
 func TestPublishRequestToStreamMessageRejectsEncodedVideoWithoutCodec(t *testing.T) {

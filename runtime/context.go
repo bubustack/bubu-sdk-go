@@ -34,6 +34,7 @@ import (
 )
 
 const runtimeStrictUnmarshalEnv = "BUBU_RUNTIME_STRICT_UNMARSHAL"
+const defaultTransportMode = "hot"
 
 // ExecutionContextData is the structure of the data provided by the
 // bobrapet controller to the SDK.
@@ -177,16 +178,8 @@ func loadTransportsFromEnv() ([]engram.TransportDescriptor, error) {
 	transports := make([]engram.TransportDescriptor, 0, len(entries))
 	seenNames := make(map[string]struct{}, len(entries))
 	for i, entry := range entries {
-		td := engram.TransportDescriptor{}
-		if name, ok := entry["name"].(string); ok {
-			td.Name = strings.TrimSpace(name)
-		}
-		if kind, ok := entry["kind"].(string); ok {
-			td.Kind = strings.TrimSpace(kind)
-		}
-		if mode, ok := entry["mode"].(string); ok {
-			td.Mode = strings.TrimSpace(mode)
-		}
+		td := parseTransportDescriptor(entry)
+		td.TypedConfig = parseTransportTypedConfig(entry)
 		if td.Name == "" {
 			return nil, fmt.Errorf("invalid %s[%d]: name is required", contracts.TransportsEnv, i)
 		}
@@ -198,7 +191,7 @@ func loadTransportsFromEnv() ([]engram.TransportDescriptor, error) {
 		}
 		seenNames[td.Name] = struct{}{}
 		if td.Mode == "" {
-			td.Mode = "hot"
+			td.Mode = defaultTransportMode
 		} else if !isValidTransportMode(td.Mode) {
 			return nil, fmt.Errorf(
 				"invalid %s[%d]: mode %q must be hot or fallback",
@@ -207,26 +200,57 @@ func loadTransportsFromEnv() ([]engram.TransportDescriptor, error) {
 				td.Mode,
 			)
 		}
-		config := make(map[string]any)
-		for k, v := range entry {
-			switch k {
-			case "name", "kind", "mode":
-				continue
-			default:
-				config[k] = v
-			}
-		}
-		if len(config) > 0 {
-			td.Config = config
-		}
 		transports = append(transports, td)
 	}
 	return transports, nil
 }
 
+func parseTransportDescriptor(entry map[string]any) engram.TransportDescriptor {
+	td := engram.TransportDescriptor{}
+	if name, ok := entry["name"].(string); ok {
+		td.Name = strings.TrimSpace(name)
+	}
+	if kind, ok := entry["kind"].(string); ok {
+		td.Kind = strings.TrimSpace(kind)
+	}
+	if mode, ok := entry["mode"].(string); ok {
+		td.Mode = strings.TrimSpace(mode)
+	}
+	return td
+}
+
+func parseTransportTypedConfig(entry map[string]any) *engram.TransportConfig {
+	if len(entry) == 0 {
+		return nil
+	}
+	raw, ok := entry["typedConfig"]
+	if !ok {
+		raw = entry["typed_config"]
+	}
+	fields, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	cfg := &engram.TransportConfig{}
+	if ref, ok := fields["transportRef"].(string); ok {
+		cfg.TransportRef = strings.TrimSpace(ref)
+	} else if ref, ok := fields["transport_ref"].(string); ok {
+		cfg.TransportRef = strings.TrimSpace(ref)
+	}
+	if reason, ok := fields["modeReason"].(string); ok {
+		cfg.ModeReason = strings.TrimSpace(reason)
+	} else if reason, ok := fields["mode_reason"].(string); ok {
+		cfg.ModeReason = strings.TrimSpace(reason)
+	}
+	if cfg.TransportRef == "" && cfg.ModeReason == "" {
+		return nil
+	}
+	return cfg
+}
+
 func isValidTransportMode(mode string) bool {
 	switch mode {
-	case "hot", "fallback":
+	case defaultTransportMode, "fallback":
 		return true
 	default:
 		return false
