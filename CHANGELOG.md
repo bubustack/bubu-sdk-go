@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/bubustack/bubu-sdk-go/compare/v0.1.4...v0.1.5) (2026-05-01)
+
+
+### Features
+
+* preserve typed transport config and update dependencies ([#84](https://github.com/bubustack/bubu-sdk-go/issues/84)) ([3e8cca6](https://github.com/bubustack/bubu-sdk-go/commit/3e8cca658df7b82230fb6fb7a926dd914296658b))
+
 ## [0.1.4](https://github.com/bubustack/bubu-sdk-go/compare/v0.1.3...v0.1.4) (2026-04-19)
 
 
