@@ -23,6 +23,7 @@ import (
 	transportconnector "github.com/bubustack/core/runtime/transport/connector"
 	"github.com/bubustack/tractatus/envelope"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
+	tractatusvalidation "github.com/bubustack/tractatus/validation"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -51,6 +52,16 @@ const (
 var errPacketDeduperPendingOverflow = errors.New("packet dedupe pending capacity exceeded")
 var errTimedSendCleanupTimeout = errors.New("timed send worker cleanup exceeded timeout")
 var errControlStartupHandshakeTimeout = errors.New("control startup handshake timed out")
+
+func validateTransportMessage(kind string, msg proto.Message) error {
+	if msg == nil {
+		return nil
+	}
+	if err := tractatusvalidation.Validate(msg); err != nil {
+		return fmt.Errorf("transport %s invalid: %w", kind, err)
+	}
+	return nil
+}
 
 type reconnectPolicy struct {
 	base       time.Duration
@@ -883,6 +894,9 @@ func connectorDataSendLoop(
 				return err
 			}
 			dataReq := publishRequestToDataRequest(req)
+			if err := validateTransportMessage("data request", dataReq); err != nil {
+				return err
+			}
 			if err := callSendWithTimeout(streamCtx, opts.messageTimeout, cancel, "data send", opts.sendTracker, func() error {
 				return stream.Send(dataReq)
 			}); err != nil {
@@ -895,6 +909,9 @@ func connectorDataSendLoop(
 		case <-ticker.C:
 			hb := &transportpb.DataRequest{
 				Metadata: map[string]string{"bubu-heartbeat": "true"},
+			}
+			if err := validateTransportMessage("data request", hb); err != nil {
+				return err
 			}
 			if err := callSendWithTimeout(streamCtx, opts.messageTimeout, cancel, "data heartbeat", opts.sendTracker, func() error { //nolint:lll
 				return stream.Send(hb)
@@ -963,6 +980,9 @@ func connectorControlLoop( //nolint:gocyclo
 			}
 			if req == nil {
 				continue
+			}
+			if err := validateTransportMessage("control request", req); err != nil {
+				return err
 			}
 			if err := callSendWithTimeout(controlCtx, opts.messageTimeout, cancel, "control internal send", opts.sendTracker, func() error { //nolint:lll
 				return stream.Send(req)
@@ -1190,6 +1210,9 @@ func processControlMessage(
 		}
 		return fmt.Errorf("control stream recv failed: %w", msg.err)
 	}
+	if err := validateTransportMessage("control response", msg.response); err != nil {
+		return err
+	}
 
 	response, handleErr := handler.HandleControlDirective(ctx, protoToControlDirective(msg.response))
 	if handleErr != nil {
@@ -1203,8 +1226,12 @@ func processControlMessage(
 	if response == nil {
 		return nil
 	}
+	req := controlDirectiveToProto(response)
+	if err := validateTransportMessage("control request", req); err != nil {
+		return err
+	}
 	if err := callSendWithTimeout(ctx, timeout, cancel, "control send", tracker, func() error {
-		return stream.Send(controlDirectiveToProto(response))
+		return stream.Send(req)
 	}); err != nil {
 		return fmt.Errorf("control stream send failed: %w", err)
 	}
@@ -1218,8 +1245,12 @@ func sendControlHeartbeat(
 	cancel context.CancelFunc,
 	tracker *timedSendTracker,
 ) error {
+	req := connectorHeartbeatDirective()
+	if err := validateTransportMessage("control request", req); err != nil {
+		return err
+	}
 	if err := callSendWithTimeout(ctx, timeout, cancel, "control heartbeat", tracker, func() error {
-		return stream.Send(connectorHeartbeatDirective())
+		return stream.Send(req)
 	}); err != nil {
 		return fmt.Errorf("control stream heartbeat failed: %w", err)
 	}
@@ -1423,7 +1454,7 @@ func streamMessageToPublishRequest(msg engram.StreamMessage) (*transportpb.Publi
 		if err := applyStreamContextToPublishRequest(req, msg); err != nil {
 			return nil, err
 		}
-		return req, nil
+		return validatedPublishRequest(req)
 	}
 	if msg.Video != nil {
 		req := &transportpb.PublishRequest{
@@ -1441,7 +1472,7 @@ func streamMessageToPublishRequest(msg engram.StreamMessage) (*transportpb.Publi
 		if err := applyStreamContextToPublishRequest(req, msg); err != nil {
 			return nil, err
 		}
-		return req, nil
+		return validatedPublishRequest(req)
 	}
 	if !shouldBypassEnvelopeForRawBinary(msg) {
 		env := streamMessageEnvelope(msg)
@@ -1459,7 +1490,7 @@ func streamMessageToPublishRequest(msg engram.StreamMessage) (*transportpb.Publi
 			if err := applyStreamContextToPublishRequest(req, msg); err != nil {
 				return nil, err
 			}
-			return req, nil
+			return validatedPublishRequest(req)
 		}
 	}
 	if msg.Binary != nil {
@@ -1479,9 +1510,16 @@ func streamMessageToPublishRequest(msg engram.StreamMessage) (*transportpb.Publi
 		if err := applyStreamContextToPublishRequest(req, msg); err != nil {
 			return nil, err
 		}
-		return req, nil
+		return validatedPublishRequest(req)
 	}
 	return nil, fmt.Errorf("stream message missing audio, video, or binary payload")
+}
+
+func validatedPublishRequest(req *transportpb.PublishRequest) (*transportpb.PublishRequest, error) {
+	if err := validateTransportMessage("publish request", req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 func shouldBypassEnvelopeForRawBinary(msg engram.StreamMessage) bool {
@@ -1497,12 +1535,20 @@ func shouldBypassEnvelopeForRawBinary(msg engram.StreamMessage) bool {
 	if len(msg.Payload) == 0 {
 		return true
 	}
+	if isStructuredJSONMimeType(msg.Binary.MimeType) {
+		return false
+	}
 	return bytes.Equal(msg.Payload, msg.Binary.Payload)
 }
 
 func isReservedEnvelopeMimeType(mimeType string) bool {
 	canonical, ok := canonicalBinaryMimeType(mimeType)
 	return ok && canonical == envelope.MIMEType
+}
+
+func isStructuredJSONMimeType(mimeType string) bool {
+	canonical, ok := canonicalBinaryMimeType(mimeType)
+	return ok && canonical == "application/json"
 }
 
 func canonicalBinaryMimeType(mimeType string) (string, bool) {
@@ -1518,6 +1564,9 @@ func canonicalBinaryMimeType(mimeType string) (string, bool) {
 }
 
 func publishRequestToStreamMessage(req *transportpb.PublishRequest) (engram.StreamMessage, error) {
+	if err := validateTransportMessage("publish request", req); err != nil {
+		return engram.StreamMessage{}, err
+	}
 	var msg engram.StreamMessage
 	switch frame := req.GetFrame().(type) {
 	case *transportpb.PublishRequest_Audio:

@@ -1186,9 +1186,13 @@ func TestJitterReconnectDelayClampsToMax(t *testing.T) {
 type fakeDataSendLoopStream struct {
 	closeSendErr   error
 	closeSendCalls int
+	sendCalls      int
 }
 
-func (f *fakeDataSendLoopStream) Send(*transportpb.DataRequest) error { return nil }
+func (f *fakeDataSendLoopStream) Send(*transportpb.DataRequest) error {
+	f.sendCalls++
+	return nil
+}
 func (f *fakeDataSendLoopStream) Recv() (*transportpb.DataResponse, error) {
 	return nil, io.EOF
 }

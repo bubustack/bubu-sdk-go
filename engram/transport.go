@@ -3,7 +3,6 @@ package engram
 import "reflect"
 
 // TransportDescriptor describes a named transport binding declared on the Story.
-// Config carries arbitrary transport-specific settings (e.g. livekit/storage blocks).
 type TransportDescriptor struct {
 	// Name is the transport binding name referenced by the Story.
 	Name string `json:"name"`
@@ -11,15 +10,24 @@ type TransportDescriptor struct {
 	Kind string `json:"kind"`
 	// Mode selects the runtime behavior for the transport binding.
 	Mode string `json:"mode,omitempty"`
-	// Config carries arbitrary transport-specific settings.
-	Config map[string]any `json:"config,omitempty"`
+	// TypedConfig carries bounded runtime descriptor metadata.
+	TypedConfig *TransportConfig `json:"typedConfig,omitempty"`
+}
+
+// TransportConfig carries safe runtime descriptor metadata.
+type TransportConfig struct {
+	// TransportRef identifies the Transport resource that produced this descriptor.
+	TransportRef string `json:"transportRef,omitempty"`
+	// ModeReason explains why the runtime selected the descriptor mode.
+	ModeReason string `json:"modeReason,omitempty"`
 }
 
 // Clone returns a deep copy of the descriptor to avoid callers mutating shared state.
 func (t TransportDescriptor) Clone() TransportDescriptor {
 	clone := t
-	if t.Config != nil {
-		clone.Config = cloneConfigMap(t.Config)
+	if t.TypedConfig != nil {
+		typed := *t.TypedConfig
+		clone.TypedConfig = &typed
 	}
 	return clone
 }

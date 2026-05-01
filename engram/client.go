@@ -711,6 +711,12 @@ func (m StreamMessage) Validate() error { //nolint:gocyclo
 	if m.Binary != nil && len(m.Payload) > 0 && !bytes.Equal(m.Payload, m.Binary.Payload) {
 		return fmt.Errorf("%w: payload and binary payload must match when both are set", ErrInvalidStreamMessage)
 	}
+	if m.Binary != nil && binaryRequiresStructuredEnvelope(m) && !bytes.Equal(m.Payload, m.Binary.Payload) {
+		return fmt.Errorf(
+			"%w: binary payload must mirror the structured payload when inputs, transports, or stream envelope are set",
+			ErrInvalidStreamMessage,
+		)
+	}
 	return nil
 }
 
@@ -767,6 +773,10 @@ func carriesStructuredEnvelopeFields(msg StreamMessage) bool {
 		len(msg.Inputs) > 0 ||
 		len(msg.Transports) > 0 ||
 		msg.Envelope != nil
+}
+
+func binaryRequiresStructuredEnvelope(msg StreamMessage) bool {
+	return len(msg.Inputs) > 0 || len(msg.Transports) > 0 || msg.Envelope != nil
 }
 
 func validateAudioFrame(audio *AudioFrame) error {

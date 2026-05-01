@@ -3,7 +3,6 @@ package sdk
 import (
 	"encoding/json"
 	"maps"
-	"reflect"
 	"strings"
 	"time"
 
@@ -88,10 +87,10 @@ func copyEnvelopeTransports(env *envelope.Envelope, transports []engram.Transpor
 	for i := range transports {
 		src := transports[i]
 		env.Transports[i] = envelope.TransportDescriptor{
-			Name:   src.Name,
-			Kind:   src.Kind,
-			Mode:   src.Mode,
-			Config: cloneConfigMap(src.Config),
+			Name:        src.Name,
+			Kind:        src.Kind,
+			Mode:        src.Mode,
+			TypedConfig: transportConfigToEnvelope(src.TypedConfig),
 		}
 	}
 	return true
@@ -130,13 +129,40 @@ func populateMessageFromEnvelope(msg *engram.StreamMessage, env *envelope.Envelo
 		for i := range env.Transports {
 			src := env.Transports[i]
 			msg.Transports[i] = engram.TransportDescriptor{
-				Name:   src.Name,
-				Kind:   src.Kind,
-				Mode:   src.Mode,
-				Config: cloneConfigMap(src.Config),
+				Name:        src.Name,
+				Kind:        src.Kind,
+				Mode:        src.Mode,
+				TypedConfig: transportConfigFromEnvelope(src.TypedConfig),
 			}
 		}
 	}
+}
+
+func transportConfigToEnvelope(src *engram.TransportConfig) *envelope.TransportConfig {
+	if src == nil {
+		return nil
+	}
+	if strings.TrimSpace(src.TransportRef) == "" && strings.TrimSpace(src.ModeReason) == "" {
+		return nil
+	}
+	return &envelope.TransportConfig{
+		TransportRef: strings.TrimSpace(src.TransportRef),
+		ModeReason:   strings.TrimSpace(src.ModeReason),
+	}
+}
+
+func transportConfigFromEnvelope(src *envelope.TransportConfig) *engram.TransportConfig {
+	if src == nil {
+		return nil
+	}
+	cfg := &engram.TransportConfig{
+		TransportRef: strings.TrimSpace(src.TransportRef),
+		ModeReason:   strings.TrimSpace(src.ModeReason),
+	}
+	if cfg.TransportRef == "" && cfg.ModeReason == "" {
+		return nil
+	}
+	return cfg
 }
 
 func cloneStringMap(src map[string]string) map[string]string {
@@ -146,74 +172,6 @@ func cloneStringMap(src map[string]string) map[string]string {
 	dst := make(map[string]string, len(src))
 	maps.Copy(dst, src)
 	return dst
-}
-
-func cloneConfigMap(src map[string]any) map[string]any {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = cloneConfigValue(v)
-	}
-	return dst
-}
-
-func cloneConfigValue(v any) any {
-	if v == nil {
-		return nil
-	}
-	return cloneConfigReflectValue(reflect.ValueOf(v)).Interface()
-}
-
-func cloneConfigReflectValue(value reflect.Value) reflect.Value {
-	if !value.IsValid() {
-		return value
-	}
-	switch value.Kind() {
-	case reflect.Interface:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		cloned := cloneConfigReflectValue(value.Elem())
-		out := reflect.New(value.Type()).Elem()
-		out.Set(cloned)
-		return out
-	case reflect.Pointer:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		out := reflect.New(value.Type().Elem())
-		out.Elem().Set(cloneConfigReflectValue(value.Elem()))
-		return out
-	case reflect.Map:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		out := reflect.MakeMapWithSize(value.Type(), value.Len())
-		iter := value.MapRange()
-		for iter.Next() {
-			out.SetMapIndex(iter.Key(), cloneConfigReflectValue(iter.Value()))
-		}
-		return out
-	case reflect.Slice:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
-		for i := 0; i < value.Len(); i++ {
-			out.Index(i).Set(cloneConfigReflectValue(value.Index(i)))
-		}
-		return out
-	case reflect.Array:
-		out := reflect.New(value.Type()).Elem()
-		for i := 0; i < value.Len(); i++ {
-			out.Index(i).Set(cloneConfigReflectValue(value.Index(i)))
-		}
-		return out
-	default:
-		return value
-	}
 }
 
 func copyBytes(src []byte) []byte {

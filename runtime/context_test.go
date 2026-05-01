@@ -35,9 +35,9 @@ const sampleTransportConfig = `[
 		"name":"rt",
 		"kind":"livekit",
 		"mode":"hot",
-		"livekit":{
-			"room":"abc",
-			"participant":"def"
+		"typedConfig":{
+			"transportRef":"livekit-default",
+			"modeReason":"streaming-default"
 		}
 	}
 ]`
@@ -108,11 +108,9 @@ func TestLoadExecutionContextData(t *testing.T) {
 						Name: "rt",
 						Kind: "livekit",
 						Mode: "hot",
-						Config: map[string]any{
-							"livekit": map[string]any{
-								"participant": "def",
-								"room":        "abc",
-							},
+						TypedConfig: &engram.TransportConfig{
+							TransportRef: "livekit-default",
+							ModeReason:   "streaming-default",
 						},
 					},
 				},
@@ -227,6 +225,36 @@ func TestLoadTransportsFromEnvDefaultsModeToHot(t *testing.T) {
 	}
 	if transports[0].Mode != "hot" { //nolint:goconst
 		t.Fatalf("expected default mode hot, got %q", transports[0].Mode)
+	}
+}
+
+func TestLoadTransportsFromEnvParsesTypedConfig(t *testing.T) {
+	t.Setenv(contracts.TransportsEnv, `[{
+		"name":"rt",
+		"kind":"livekit",
+		"mode":"hot",
+		"typedConfig":{
+			"transportRef":"livekit-default",
+			"modeReason":"streaming-default"
+		}
+	}]`)
+
+	transports, err := loadTransportsFromEnv()
+	if err != nil {
+		t.Fatalf("loadTransportsFromEnv() error = %v", err)
+	}
+	if len(transports) != 1 {
+		t.Fatalf("expected 1 transport, got %d", len(transports))
+	}
+	typed := transports[0].TypedConfig
+	if typed == nil {
+		t.Fatal("expected typed config")
+	}
+	if typed.TransportRef != "livekit-default" {
+		t.Fatalf("expected typed transport ref, got %q", typed.TransportRef)
+	}
+	if typed.ModeReason != "streaming-default" {
+		t.Fatalf("expected typed mode reason, got %q", typed.ModeReason)
 	}
 }
 

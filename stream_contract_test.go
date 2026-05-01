@@ -2,10 +2,12 @@ package sdk
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/bubustack/bubu-sdk-go/engram"
 	"github.com/bubustack/tractatus/envelope"
+	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -76,4 +78,126 @@ func TestStreamMessageToPublishRequestRawBinaryWithInputsUsesEnvelope(t *testing
 	require.Equal(t, inputs, roundTrip.Inputs)
 	require.NotNil(t, roundTrip.Binary)
 	require.Equal(t, "application/json", roundTrip.Binary.MimeType)
+}
+
+func TestStreamMessageToPublishRequestMirroredJSONBinaryUsesEnvelopeForPacketTemplates(t *testing.T) {
+	payload := []byte(`{"text":"bonjour","sender":"speaker"}`)
+	msg := engram.StreamMessage{
+		Kind:    "chat.message.v1",
+		Payload: payload,
+		Binary: &engram.BinaryFrame{
+			Payload:  payload,
+			MimeType: "application/json",
+		},
+	}
+
+	req, err := streamMessageToPublishRequest(msg)
+
+	require.NoError(t, err)
+	require.NotNil(t, req.GetBinary())
+	require.Equal(t, envelope.MIMEType, req.GetBinary().GetMimeType())
+	require.NotNil(t, req.GetPayload())
+	require.Equal(t, "bonjour", req.GetPayload().AsMap()["text"])
+}
+
+func TestStreamMessageToPublishRequestRejectsRawBinaryWithInputsWithoutMirroredPayload(t *testing.T) {
+	msg := engram.StreamMessage{
+		Kind:   "data",
+		Inputs: []byte(`{"userPrompt":"hello"}`),
+		Binary: &engram.BinaryFrame{
+			Payload:  []byte("opaque"),
+			MimeType: "application/octet-stream",
+		},
+	}
+
+	req, err := streamMessageToPublishRequest(msg)
+
+	require.ErrorIs(t, err, engram.ErrInvalidStreamMessage)
+	require.Nil(t, req)
+}
+
+func TestStreamMessageToPublishRequestRejectsInvalidEnvelopePayloadJSON(t *testing.T) {
+	msg := engram.StreamMessage{
+		Kind:    "data",
+		Payload: []byte(`{"text":`),
+	}
+
+	req, err := streamMessageToPublishRequest(msg)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "envelope payload is not valid JSON")
+	require.Nil(t, req)
+}
+
+func TestPublishRequestToStreamMessageRejectsInvalidEnvelopePayloadJSON(t *testing.T) {
+	req := &transportpb.PublishRequest{
+		Frame: &transportpb.PublishRequest_Binary{
+			Binary: &transportpb.BinaryFrame{
+				Payload:  []byte(`{"payload":`),
+				MimeType: envelope.MIMEType,
+			},
+		},
+	}
+
+	_, err := publishRequestToStreamMessage(req)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "envelope decode failed")
+}
+
+func TestPublishRequestToStreamMessageRejectsEnvelopeTimestampOverflow(t *testing.T) {
+	req := &transportpb.PublishRequest{
+		Frame: &transportpb.PublishRequest_Binary{
+			Binary: &transportpb.BinaryFrame{
+				Payload:     []byte(`{"version":"v1","kind":"data","payload":{"ok":true}}`),
+				MimeType:    envelope.MIMEType,
+				TimestampMs: uint64(math.MaxInt64) + 1,
+			},
+		},
+	}
+
+	_, err := publishRequestToStreamMessage(req)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timestamp")
+}
+
+func TestStreamMessageToPublishRequestRejectsProtoInvalidTransportCount(t *testing.T) {
+	transports := make([]engram.TransportDescriptor, 11)
+	for i := range transports {
+		transports[i] = engram.TransportDescriptor{Name: "transport"}
+	}
+	payload := []byte(`{"payload":"value"}`)
+	msg := engram.StreamMessage{
+		Kind:       "data",
+		Payload:    payload,
+		Binary:     &engram.BinaryFrame{Payload: payload, MimeType: "application/json"},
+		Transports: transports,
+	}
+
+	_, err := streamMessageToPublishRequest(msg)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "transport publish request invalid")
+}
+
+func TestPublishRequestToStreamMessageRejectsProtoInvalidTransportCount(t *testing.T) {
+	transports := make([]*transportpb.TransportDescriptor, 11)
+	for i := range transports {
+		transports[i] = &transportpb.TransportDescriptor{Name: "transport"}
+	}
+	req := &transportpb.PublishRequest{
+		Frame: &transportpb.PublishRequest_Binary{
+			Binary: &transportpb.BinaryFrame{
+				Payload:  []byte("payload"),
+				MimeType: "application/octet-stream",
+			},
+		},
+		Transports: transports,
+	}
+
+	_, err := publishRequestToStreamMessage(req)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "transport publish request invalid")
 }

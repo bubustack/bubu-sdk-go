@@ -46,10 +46,7 @@ func applyStreamContextToPublishRequest(req *transportpb.PublishRequest, msg eng
 		}
 	}
 
-	transports, err := transportsToProto(msg.Transports)
-	if err != nil {
-		return err
-	}
+	transports := transportsToProto(msg.Transports)
 	if len(transports) > 0 {
 		req.Transports = transports
 	}
@@ -188,29 +185,21 @@ func structToJSONBytes(st *structpb.Struct) ([]byte, error) {
 	return st.MarshalJSON()
 }
 
-func transportsToProto(transports []engram.TransportDescriptor) ([]*transportpb.TransportDescriptor, error) {
+func transportsToProto(transports []engram.TransportDescriptor) []*transportpb.TransportDescriptor {
 	if len(transports) == 0 {
-		return nil, nil
+		return nil
 	}
 	out := make([]*transportpb.TransportDescriptor, len(transports))
 	for i := range transports {
 		td := transports[i]
-		var cfg *structpb.Struct
-		if len(td.Config) > 0 {
-			var err error
-			cfg, err = structpb.NewStruct(td.Config)
-			if err != nil {
-				return nil, fmt.Errorf("transport %q config encode failed: %w", td.Name, err)
-			}
-		}
 		out[i] = &transportpb.TransportDescriptor{
-			Name:   td.Name,
-			Kind:   td.Kind,
-			Mode:   td.Mode,
-			Config: cfg,
+			Name:        td.Name,
+			Kind:        td.Kind,
+			Mode:        td.Mode,
+			TypedConfig: transportConfigToProto(td.TypedConfig),
 		}
 	}
-	return out, nil
+	return out
 }
 
 func transportsFromProto(src []*transportpb.TransportDescriptor) []engram.TransportDescriptor {
@@ -222,19 +211,42 @@ func transportsFromProto(src []*transportpb.TransportDescriptor) []engram.Transp
 		if td == nil {
 			continue
 		}
-		var cfg map[string]any
-		if st := td.GetConfig(); st != nil {
-			cfg = cloneConfigMap(st.AsMap())
-		}
 		out = append(out, engram.TransportDescriptor{
-			Name:   td.GetName(),
-			Kind:   td.GetKind(),
-			Mode:   td.GetMode(),
-			Config: cfg,
+			Name:        td.GetName(),
+			Kind:        td.GetKind(),
+			Mode:        td.GetMode(),
+			TypedConfig: transportConfigFromProto(td.GetTypedConfig()),
 		})
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func transportConfigToProto(src *engram.TransportConfig) *transportpb.TransportConfig {
+	if src == nil {
+		return nil
+	}
+	if strings.TrimSpace(src.TransportRef) == "" && strings.TrimSpace(src.ModeReason) == "" {
+		return nil
+	}
+	return &transportpb.TransportConfig{
+		TransportRef: strings.TrimSpace(src.TransportRef),
+		ModeReason:   strings.TrimSpace(src.ModeReason),
+	}
+}
+
+func transportConfigFromProto(src *transportpb.TransportConfig) *engram.TransportConfig {
+	if src == nil {
+		return nil
+	}
+	cfg := &engram.TransportConfig{
+		TransportRef: strings.TrimSpace(src.GetTransportRef()),
+		ModeReason:   strings.TrimSpace(src.GetModeReason()),
+	}
+	if cfg.TransportRef == "" && cfg.ModeReason == "" {
+		return nil
+	}
+	return cfg
 }
